@@ -51,6 +51,48 @@ class TrTUnet:
     def __call__(self, x, timesteps, context, y=None, control=None, transformer_options=None, **kwargs):
         model_inputs = {"x": x, "timesteps": timesteps, "context": context}
 
+        # Align context's feature dimension with engine expectation (e.g., 2048 for Lumina2)
+        try:
+            ctx_name = "context"
+            if ctx_name in model_inputs:
+                # Profile ranges provide concrete min/opt/max values per dim
+                prof_min, prof_opt, prof_max = self.engine.get_tensor_profile_shape(ctx_name, 0)
+                # Shapes are (B, L, C) for context
+                min_len = prof_min[1] if len(prof_min) >= 2 else None
+                max_len = prof_max[1] if len(prof_max) >= 2 else None
+                expected_feat = prof_min[2] if len(prof_min) >= 3 else None
+
+                ctx = model_inputs[ctx_name]
+                # 1) Fix feature dimension C to expected (e.g., 2048)
+                if expected_feat is not None and expected_feat != -1:
+                    actual_feat = ctx.shape[-1]
+                    if actual_feat != expected_feat:
+                        if actual_feat > expected_feat:
+                            ctx = ctx[..., :expected_feat]
+                        else:
+                            pad_c = expected_feat - actual_feat
+                            ctx = torch.nn.functional.pad(ctx, (0, pad_c), mode="constant", value=0)
+
+                # 2) Clamp/pad sequence length L into [min_len, max_len]
+                if (min_len is not None and min_len != -1) or (max_len is not None and max_len != -1):
+                    B, L, C = ctx.shape[0], ctx.shape[1], ctx.shape[2]
+                    # Truncate if longer than allowed
+                    if max_len is not None and max_len != -1 and L > max_len:
+                        ctx = ctx[:, :max_len, :]
+                        L = max_len
+                    # Pad if shorter than allowed
+                    if min_len is not None and min_len != -1 and L < min_len:
+                        pad_L = min_len - L
+                        # Repeat the last valid token instead of zeros to reduce artifacts
+                        last_tok = ctx[:, L - 1:L, :]
+                        pad_tensor = last_tok.expand(B, pad_L, C)
+                        ctx = torch.cat([ctx, pad_tensor], dim=1)
+
+                model_inputs[ctx_name] = ctx.contiguous()
+        except Exception:
+            # Best-effort; if inspection fails, continue and let TRT report a clear error
+            pass
+
         if y is not None:
             model_inputs["y"] = y
 

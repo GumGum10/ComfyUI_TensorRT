@@ -3,11 +3,101 @@ import sys
 import os
 import time
 import logging
+import threading
+import subprocess
+import shutil
 import comfy.model_management
 
 import tensorrt as trt
 import folder_paths
 from tqdm import tqdm
+
+
+class GPUProbe:
+    """Lightweight GPU telemetry using NVML if available, else nvidia-smi fallback.
+    Exposes a stats_str() with utilization, memory, temp, and power.
+    """
+
+    def __init__(self, device_index: int | None = None):
+        self.idx = int(device_index) if device_index is not None else (torch.cuda.current_device() if torch.cuda.is_available() else 0)
+        self._nvml = None
+        self._nvml_device = None
+        # Try NVML first
+        try:
+            import pynvml  # type: ignore
+
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._nvml_device = pynvml.nvmlDeviceGetHandleByIndex(self.idx)
+        except Exception:
+            # Fallback to nvidia-smi via subprocess
+            self._nvml = None
+            self._nvml_device = None
+
+    def _stats_via_nvml(self) -> str | None:
+        try:
+            if self._nvml is None or self._nvml_device is None:
+                return None
+            nvml = self._nvml
+            h = self._nvml_device
+            util = nvml.nvmlDeviceGetUtilizationRates(h)
+            mem = nvml.nvmlDeviceGetMemoryInfo(h)
+            temp = nvml.nvmlDeviceGetTemperature(h, nvml.NVML_TEMPERATURE_GPU)
+            try:
+                power = nvml.nvmlDeviceGetPowerUsage(h) / 1000.0  # W
+            except Exception:
+                power = None
+            used_gb = mem.used / (1024**3)
+            total_gb = mem.total / (1024**3)
+            pwr = f" {power:.0f}W" if power is not None else ""
+            return f"GPU{self.idx} {util.gpu}% {used_gb:.1f}/{total_gb:.1f} GB {temp}C{pwr}"
+        except Exception:
+            return None
+
+    def _stats_via_nvsmi(self) -> str | None:
+        try:
+            if shutil.which("nvidia-smi") is None:
+                return None
+            # Query a single GPU index
+            q = "utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
+            cmd = [
+                "nvidia-smi",
+                f"--id={self.idx}",
+                f"--query-gpu={q}",
+                "--format=csv,noheader,nounits",
+            ]
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=1.0)
+            # Example: "25, 1550, 24564, 45, 120.50"
+            parts = [p.strip() for p in out.strip().split(",")]
+            if len(parts) >= 5:
+                util = float(parts[0])
+                used_mb = float(parts[1])
+                total_mb = float(parts[2])
+                temp = float(parts[3])
+                power = float(parts[4])
+                used_gb = used_mb / 1024.0
+                total_gb = total_mb / 1024.0
+                return f"GPU{self.idx} {util:.0f}% {used_gb:.1f}/{total_gb:.1f} GB {temp:.0f}C {power:.0f}W"
+            return None
+        except Exception:
+            return None
+
+    def stats_str(self) -> str:
+        # Prefer NVML; fallback to nvidia-smi; else minimal torch memory
+        s = self._stats_via_nvml()
+        if s:
+            return s
+        s = self._stats_via_nvsmi()
+        if s:
+            return s
+        try:
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info()
+                used = total - free
+                return f"GPU{self.idx} {used/1e9:.1f}/{total/1e9:.1f} GB"
+        except Exception:
+            pass
+        return "GPU N/A"
 
 # TODO:
 # Make it more generic: less model specific code
@@ -25,7 +115,7 @@ else:
     )
 
 class TQDMProgressMonitor(trt.IProgressMonitor):
-    def __init__(self):
+    def __init__(self, gpu_probe: GPUProbe | None = None):
         trt.IProgressMonitor.__init__(self)
         self._active_phases = {}
         self._step_result = True
@@ -33,8 +123,15 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
         self._last_log_time = {}
         self._phase_meta = {}  # phase_name -> {total, start_time}
         self._log_interval = 2.0  # seconds
+        self._gpu_probe = gpu_probe
 
     def _gpu_mem_str(self):
+        try:
+            if self._gpu_probe is not None:
+                return self._gpu_probe.stats_str()
+        except Exception:
+            pass
+        # Fallback minimal
         try:
             if torch.cuda.is_available():
                 free, total = torch.cuda.mem_get_info()
@@ -185,6 +282,47 @@ class TRT_MODEL_CONVERSION_BASE:
         path = self._current_timing_cache_path
         with open(path, "wb") as timing_cache_file:
             timing_cache_file.write(memoryview(timing_cache.serialize()))
+
+    def _start_progress_heartbeat(self, monitor: "TQDMProgressMonitor", interval_s: float = 5.0):
+        """Start a background thread that logs a heartbeat for the current active phase.
+
+        Returns a tuple (stop_event, thread). Caller must set stop_event and join thread when done.
+        """
+        stop_event = threading.Event()
+
+        def _heartbeat():
+            while not stop_event.wait(interval_s):
+                try:
+                    # Find the deepest active phase (max indent)
+                    if not monitor._active_phases:
+                        continue
+                    # Choose the phase with highest nbIndents (deepest) or the last started
+                    phase = None
+                    max_indent = -1
+                    for name, data in list(monitor._active_phases.items()):
+                        indent = data.get("nbIndents", 0)
+                        if indent >= max_indent:
+                            max_indent = indent
+                            phase = name
+                    if phase is None:
+                        continue
+                    tq = monitor._active_phases[phase]["tq"]
+                    total = max(1, int(tq.total))
+                    step = int(tq.n)
+                    percent = 100.0 * min(step, total) / total
+                    meta = monitor._phase_meta.get(phase, {})
+                    start_time = meta.get("start_time", time.time())
+                    elapsed = time.time() - start_time
+                    logging.info(
+                        f"[TRT][heartbeat] {phase}: {step}/{total} ({percent:.1f}%) elapsed={elapsed:.1f}s {monitor._gpu_mem_str()}"
+                    )
+                except Exception:
+                    # Best-effort; ignore heartbeat errors
+                    pass
+
+        th = threading.Thread(target=_heartbeat, name="TRTProgressHeartbeat", daemon=True)
+        th.start()
+        return stop_event, th
 
     def _convert(
         self,
@@ -576,7 +714,9 @@ class TRT_MODEL_CONVERSION_BASE:
         
         logging.info("[TensorRT] Setting up timing cache")
         self._setup_timing_cache(config)
-        config.progress_monitor = TQDMProgressMonitor()
+        # Attach GPU probe to progress monitor for richer telemetry
+        gpu_idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        config.progress_monitor = TQDMProgressMonitor(gpu_probe=GPUProbe(gpu_idx))
 
         # Builder configuration: choose between fast-build (shorter compile) and max-perf (longer compile)
         if fast_build:
@@ -707,6 +847,16 @@ class TRT_MODEL_CONVERSION_BASE:
 
         logging.info("[TensorRT] Building TensorRT engine")
         try:
+            # Start heartbeat before build to show logs inside long steps
+            monitor = config.progress_monitor  # type: ignore[attr-defined]
+            stop_event = None
+            hb_thread = None
+            if isinstance(monitor, TQDMProgressMonitor):
+                try:
+                    stop_event, hb_thread = self._start_progress_heartbeat(monitor, interval_s=5.0)
+                except Exception:
+                    pass
+
             serialized_engine = builder.build_serialized_network(network, config)
             logging.info("[TensorRT] Successfully built TensorRT engine")
             
@@ -714,7 +864,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 logging.error("[TensorRT] Engine serialization failed!")
                 return ()
                 
-            logging.info(f"[TensorRT] Engine size: {len(serialized_engine)} bytes")
+            # logging.info(f"[TensorRT] Engine size: {len(serialized_engine)} bytes")
 
             full_output_folder, filename, counter, subfolder, filename_prefix = (
                 folder_paths.get_save_image_path(filename_prefix, self.output_dir)
@@ -735,6 +885,15 @@ class TRT_MODEL_CONVERSION_BASE:
         except Exception as e:
             logging.error(f"[TensorRT] Error during engine building/saving: {str(e)}")
             raise
+        finally:
+            # Stop heartbeat if it was started
+            try:
+                if 'stop_event' in locals() and stop_event is not None:
+                    stop_event.set()
+                if 'hb_thread' in locals() and hb_thread is not None:
+                    hb_thread.join(timeout=1.0)
+            except Exception:
+                pass
 
         return ()
 
