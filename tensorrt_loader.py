@@ -114,7 +114,7 @@ class TensorRTLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {"unet_name": (folder_paths.get_filename_list("tensorrt"), ),
-                             "model_type": (["sdxl_base", "sdxl_refiner", "sd1.x", "sd2.x-768v", "svd", "sd3", "auraflow", "flux_dev", "flux_schnell"], ),
+                             "model_type": (["sdxl_base", "sdxl_refiner", "sd1.x", "sd2.x-768v", "svd", "sd3", "auraflow", "flux_dev", "flux_schnell", "lumina2"], ),
                              }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
@@ -164,6 +164,12 @@ class TensorRTLoader:
             conf.unet_config["disable_unet_model_creation"] = True
             model = conf.get_model({})
             unet.dtype = torch.bfloat16 #TODO: autodetect
+        elif model_type == "lumina2":
+            from comfy.supported_models import Lumina2 as Lumina2Config
+            conf = Lumina2Config({})
+            conf.unet_config["disable_unet_model_creation"] = True
+            model = conf.get_model({})
+            unet.dtype = torch.bfloat16  # Match ComfyUI default
         model.diffusion_model = unet
         model.memory_required = lambda *args, **kwargs: 0 #always pass inputs batched up as much as possible, our TRT code will handle batch splitting
 
