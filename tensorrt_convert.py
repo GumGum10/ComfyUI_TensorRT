@@ -3,14 +3,114 @@ import sys
 import os
 import time
 import logging
+
+def setup_tensorrt_logging(log_file="tensorrt_build.log"):
+    """Setup comprehensive logging to file"""
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - [%(levelname)s] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # File handler (everything)
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    
+    # Console handler (INFO and above)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    
+    # Root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    # Also capture print statements
+    class TeeOutput:
+        def __init__(self, file_path):
+            self.terminal = sys.stdout
+            self.log = open(file_path, 'a', encoding='utf-8')
+        
+        def write(self, message):
+            self.terminal.write(message)
+            self.log.write(message)
+            self.log.flush()
+        
+        def flush(self):
+            self.terminal.flush()
+            self.log.flush()
+    
+    # Redirect stdout to also write to file
+    sys.stdout = TeeOutput(log_file)
+    
+    return log_file
+
+
 import threading
 import subprocess
 import shutil
-import comfy.model_management
 
+# CRITICAL: Set TensorRT logger BEFORE importing tensorrt!
+import ctypes
+import sys
+
+class PreInitTRTLogger:
+    """Set logger before TensorRT loads"""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        self.messages = []
+        
+    def log(self, severity, msg):
+        timestamp = time.strftime('%H:%M:%S')
+        self.messages.append((timestamp, severity, msg))
+        # Print immediately
+        if "tactic" in msg.lower() or "kernel" in msg.lower():
+            print(f"[{timestamp}] 🔍 {msg}")
+        elif "error" in msg.lower():
+            print(f"[{timestamp}] ❌ {msg}")
+        elif "warning" in msg.lower():
+            print(f"[{timestamp}] ⚠️  {msg}")
+
+# Pre-initialize logger
+_pre_logger = PreInitTRTLogger()
+
+# NOW import TensorRT
 import tensorrt as trt
+
+# Override the logger immediately
+try:
+    # This must happen before any Builder/Runtime creation
+    original_logger = trt.Logger(trt.Logger.VERBOSE)
+except Exception as e:
+    print(f"Failed to override logger: {e}")
+
+import comfy.model_management
 import folder_paths
 from tqdm import tqdm
+
+try:
+    from .tensorrt_verbose_logging import create_verbose_logger
+    VERBOSE_LOGGING_AVAILABLE = True
+except ImportError:
+    VERBOSE_LOGGING_AVAILABLE = False
+    logging.warning("[TensorRT] Verbose logging not available")
+
+try:
+    from .lumina2_onnx_patch import patch_lumina2_for_onnx_export
+    LUMINA2_PATCH_AVAILABLE = True
+except ImportError:
+    LUMINA2_PATCH_AVAILABLE = False
+    logging.warning("[TensorRT] Lumina2 ONNX patch not available")
 
 
 class GPUProbe:
@@ -99,8 +199,6 @@ class GPUProbe:
             pass
         return "GPU N/A"
 
-# TODO:
-# Make it more generic: less model specific code
 
 # add output directory to tensorrt search path
 if "tensorrt" in folder_paths.folder_names_and_paths:
@@ -344,6 +442,19 @@ class TRT_MODEL_CONVERSION_BASE:
         is_static: bool,
         fast_build: bool = False,
     ):
+        tensorrt_log_dir = os.path.join(self.output_dir, "tensorrt", "logs")
+        os.makedirs(tensorrt_log_dir, exist_ok=True)
+        
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_filename = f"tensorrt_build_{timestamp}.log"
+        log_file = os.path.join(tensorrt_log_dir, log_filename)
+        
+        setup_tensorrt_logging(log_file)
+        logging.info(f"[TensorRT] ========================================")
+        logging.info(f"[TensorRT] Log file: {log_file}")
+        logging.info(f"[TensorRT] ========================================")
+        print(f"\n📝 TensorRT build log: {log_file}\n")
+
         # Update per-prefix timing cache path early
         self._update_timing_cache_path(filename_prefix)
         output_onnx = os.path.normpath(
@@ -363,6 +474,15 @@ class TRT_MODEL_CONVERSION_BASE:
         y_dim = model.model.adm_channels
         extra_input = {}
         dtype = torch.float16
+        # In tensorrt_convert.py, around line 360, ADD THIS:
+        logging.info(f"[TensorRT] ===== MODEL DETECTION =====")
+        logging.info(f"[TensorRT] Model type: {type(model.model)}")
+        logging.info(f"[TensorRT] Model base: {type(model.model).__bases__}")
+        logging.info(f"[TensorRT] Is SD3: {isinstance(model.model, comfy.model_base.SD3)}")
+        logging.info(f"[TensorRT] Is Flux: {isinstance(model.model, comfy.model_base.Flux)}")
+        logging.info(f"[TensorRT] Is Lumina2: {isinstance(model.model, comfy.model_base.Lumina2)}")
+        logging.info(f"[TensorRT] Model config: {model.model.model_config.__class__.__name__}")
+        logging.info(f"[TensorRT] =============================")
 
         if isinstance(model.model, comfy.model_base.SD3): #SD3
             context_embedder_config = model.model.model_config.unet_config.get("context_embedder_config", None)
@@ -383,102 +503,31 @@ class TRT_MODEL_CONVERSION_BASE:
         elif is_lumina2:
             logging.info("[TensorRT] Detected Lumina2 model, configuring NextDiT architecture")
             
-            # Lumina2-specific configuration based on the paper
-            context_dim = 2048  # Fixed context dimension for NextDiT
-            text_tokens = 77  # Base text token length
-            image_tokens = 256  # Image token length from paper
-            context_len_min = text_tokens
-            context_len = text_tokens + image_tokens  # Total sequence length
-            y_dim = 0  # Lumina2 doesn't use ADM channels
-            dtype = torch.bfloat16  # Using bfloat16 as specified
+            # Apply ONNX compatibility patch
+            if LUMINA2_PATCH_AVAILABLE:
+                patch_lumina2_for_onnx_export()
+            else:
+                raise RuntimeError("Lumina2 ONNX patch is required but not available. Please ensure lumina2_onnx_patch.py is in the same directory.")
+            
+            # Use actual Gemma2-2B embedding dimension
+            context_dim = 2304
+            context_len_min = 512
+            context_len = 512
+            
+            y_dim = 0
+            dtype = torch.bfloat16
+
+           
+            # CRITICAL FIX: Don't add num_tokens as a dynamic input
+            # Instead, we'll wrap the model to use context.shape[1] as num_tokens
+            extra_input = {}  # Changed from {"num_tokens": ()}
             
             logging.info(f"[TensorRT] Lumina2 Configuration:")
             logging.info(f"[TensorRT] - Context Dimension: {context_dim}")
-            logging.info(f"[TensorRT] - Text Tokens: {text_tokens}")
-            logging.info(f"[TensorRT] - Image Tokens: {image_tokens}")
-            logging.info(f"[TensorRT] - Total Sequence Length: {context_len}")
-            logging.info(f"[TensorRT] - Data Type: {dtype}")            
-            class NextDiTWrapper(torch.nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.unet = None
-                    self.debug = True  # Enable debug logging
-
-                def set_unet(self, unet):
-                    self.unet = unet
-                    return self
-
-                def forward(self, x, timesteps, context, *args, **kwargs):
-                    logging.info(f"[NextDiT] Processing input tensors:")
-                    logging.info(f"[NextDiT] - Input shape (x): {x.shape}")
-                    logging.info(f"[NextDiT] - Timesteps shape: {timesteps.shape}")
-                    logging.info(f"[NextDiT] - Context shape (before): {context.shape}")
-                    
-                    # Handle text and latent tokens for NextDiT architecture
-                    if not isinstance(context, torch.Tensor):
-                        raise TypeError(f"[NextDiT] Expected context to be a tensor, got {type(context)}")
-                    
-                    B, L, D = context.shape
-                    logging.info(f"[NextDiT] Context dimensions: batch={B}, length={L}, dim={D}")
-                    
-                    if D != 2304:
-                        if D == 2048:
-                            # Pad from 2048 to 2304 to match the model's internal layers
-                            logging.info("[NextDiT] Padding context from 2048 to 2304 dimensions")
-                            pad_size = 2304 - 2048
-                            context = torch.nn.functional.pad(
-                                context, 
-                                (0, pad_size), 
-                                mode='constant', 
-                                value=0
-                            ).contiguous()
-                            logging.info(f"[NextDiT] Context padded shape: {context.shape}")
-                        else:
-                            raise ValueError(f"[NextDiT] Unexpected context dimension: {D} (expected 2048 or 2304)")
-                    
-                    if context.isnan().any():
-                        logging.error("[NextDiT] Found NaN values in context!")
-                        raise ValueError("[NextDiT] Context tensor contains NaN values")
-                    
-                    # Log tensor statistics
-                    with torch.no_grad():
-                        ctx_mean = context.mean().item()
-                        ctx_std = context.std().item()
-                        logging.info(f"[NextDiT] Context statistics: mean={ctx_mean:.4f}, std={ctx_std:.4f}")
-                    
-                    # Calculate tokens for NextDiT architecture
-                    num_tokens = context.shape[1]  # Use direct sequence length
-                    logging.info(f"[NextDiT] Sequence information:")
-                    logging.info(f"[NextDiT] - Number of tokens: {num_tokens}")
-                    logging.info(f"[NextDiT] - Context final shape: {context.shape}")
-                    
-                    # Filter out transformer_options since NextDiT uses unified attention
-                    kwargs.pop('transformer_options', None)
-                    
-                    if self.unet is None:
-                        raise RuntimeError("NextDiTWrapper's UNet is not set!")
-                    
-                    # Forward through NextDiT UNet
-                    try:
-                        output = self.unet(x, timesteps, context, num_tokens=num_tokens, **kwargs)
-                        logging.info(f"[NextDiT] Output shape: {output.shape}")
-                        return output
-                    except Exception as e:
-                        logging.error(f"[NextDiT] Error in UNet forward pass: {str(e)}")
-                        logging.error(f"[NextDiT] Last known tensor shapes:")
-                        logging.error(f" - x: {x.shape}")
-                        logging.error(f" - timesteps: {timesteps.shape}")
-                        logging.error(f" - context: {context.shape}")
-                        raise
-
-            # Create and configure NextDiT wrapper
-            next_dit = NextDiTWrapper()
-            next_dit.set_unet(unet)
-            unet = next_dit
-
-            extra_input = {}
-            print(f"✅ Detected Lumina-Image 2.0 model with NextDiT architecture (context_dim={context_dim}, seq_len={context_len})")
-
+            logging.info(f"[TensorRT] - Context Length Min/Opt: {context_len_min}/{context_len}")
+            logging.info(f"[TensorRT] - Data Type: {dtype}")
+            
+            print(f"✅ Lumina2 NextDiT ready for ONNX export (context_dim={context_dim})")
 
         if context_dim is not None:
             input_names = ["x", "timesteps", "context"]
@@ -487,10 +536,47 @@ class TRT_MODEL_CONVERSION_BASE:
             dynamic_axes = {
                 "x": {0: "batch", 2: "height", 3: "width"},
                 "timesteps": {0: "batch"},
-                "context": {0: "batch", 1: "num_embeds"} if not is_lumina2 else {0: "batch", 1: "seq_len"},
+                "context": {0: "batch", 1: "seq_len"},  # FIXED: Use seq_len for Lumina2
             }
 
             transformer_options = model.model_options['transformer_options'].copy()
+            
+            # LUMINA2: Wrap model now that we have transformer_options
+            if is_lumina2:
+                class Lumina2ONNXWrapper(torch.nn.Module):
+                    """
+                    ONNX-compatible wrapper for Lumina2 that derives num_tokens from context shape
+                    """
+                    def __init__(self, unet, transformer_options):
+                        super().__init__()
+                        self.unet = unet
+                        self.transformer_options = transformer_options
+                        
+                    def forward(self, x, timesteps, context):
+                        """
+                        Args:
+                            x: [B, C, H, W] latent tensor
+                            timesteps: [B] timestep tensor  
+                            context: [B, L, D] text embeddings
+                        """
+                        # Derive num_tokens from context sequence length
+                        # This makes it a constant in the ONNX graph based on the input shape
+                        num_tokens = context.shape[1]
+                        
+                        # Call original model
+                        return self.unet(
+                            x,
+                            timesteps,
+                            context,
+                            num_tokens=num_tokens,
+                            attention_mask=None,
+                            transformer_options=self.transformer_options
+                        )
+                
+                # Wrap the model
+                unet = Lumina2ONNXWrapper(unet, transformer_options)
+                logging.info("[TensorRT] Wrapped Lumina2 model with ONNX-compatible wrapper")
+            
             if model.model.model_config.unet_config.get(
                 "use_temporal_resblock", False
             ):  # SVD
@@ -515,7 +601,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 svd_unet.transformer_options = transformer_options
                 unet = svd_unet
                 context_len_min = context_len = 1
-            else:
+            elif not is_lumina2:  # Don't wrap again if already wrapped for Lumina2
                 class UNET(torch.nn.Module):
                     def forward(self, x, timesteps, context, *args):
                         extras = input_names[3:]
@@ -566,6 +652,9 @@ class TRT_MODEL_CONVERSION_BASE:
             for i, shape in enumerate(inputs_shapes_opt):
                 # Use float32 for timesteps for better ONNX/TRT compatibility
                 in_dtype = torch.float32 if (i == 1) else dtype
+                # FIXED: num_tokens should be int32
+                if i < len(input_names) and input_names[i] == "num_tokens":
+                    in_dtype = torch.int32
                 inputs += (
                     torch.zeros(
                         shape,
@@ -596,8 +685,8 @@ class TRT_MODEL_CONVERSION_BASE:
             
             # Check for NaN/Inf values
             with torch.no_grad():
-                has_nan = tensor.isnan().any().item()
-                has_inf = tensor.isinf().any().item()
+                has_nan = tensor.isnan().any().item() if tensor.dtype.is_floating_point else False
+                has_inf = tensor.isinf().any().item() if tensor.dtype.is_floating_point else False
                 if has_nan or has_inf:
                     logging.warning(f"[TensorRT] Found NaN/Inf in {name} tensor!")
         
@@ -607,7 +696,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 unet,
                 inputs,
                 output_onnx,
-                verbose=True,  # Enable verbose mode for more detailed export info
+                verbose=False,  # Set to True for debugging
                 input_names=input_names,
                 output_names=output_names,
                 opset_version=17,
@@ -654,7 +743,12 @@ class TRT_MODEL_CONVERSION_BASE:
 
         # TRT conversion starts here
         logging.info("[TensorRT] Starting TensorRT conversion phase")
-        logger = trt.Logger(trt.Logger.INFO)
+        if VERBOSE_LOGGING_AVAILABLE:
+            logger = create_verbose_logger()
+            logging.info("[TensorRT] Using detailed verbose logging")
+        else:
+            logger = trt.Logger(trt.Logger.VERBOSE)
+            
         builder = trt.Builder(logger)
         logging.info(f"[TensorRT] Created TensorRT builder (version: {trt.__version__})")
 
@@ -717,62 +811,82 @@ class TRT_MODEL_CONVERSION_BASE:
         # Attach GPU probe to progress monitor for richer telemetry
         gpu_idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
         config.progress_monitor = TQDMProgressMonitor(gpu_probe=GPUProbe(gpu_idx))
-
-        # Builder configuration: choose between fast-build (shorter compile) and max-perf (longer compile)
+        # Builder configuration: Optimal settings for your hardware
         if fast_build:
+            # FAST BUILD MODE (for iteration/testing)
             try:
-                # Smaller workspace reduces tactic exploration and compile time
-                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)
-                logging.info("[TensorRT] [fast_build] Set WORKSPACE to 4 GiB")
+                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 20 << 30)  # 20GB (increased from 4GB)
+                logging.info("[TensorRT] [fast_build] Set WORKSPACE to 20 GiB")
             except Exception as e:
-                logging.debug(f"[TensorRT] [fast_build] set_memory_pool_limit not available: {e}")
+                logging.debug(f"[TensorRT] [fast_build] set_memory_pool_limit error: {e}")
+            
             try:
                 if hasattr(config, 'builder_optimization_level'):
-                    config.builder_optimization_level = 2
-                    logging.info("[TensorRT] [fast_build] builder_optimization_level=2")
+                    config.builder_optimization_level = 0  # DEBUG DEBUG DEBUG 0 -> USES FIRST FOUND ALGO
+                    logging.info(f"✨✨✨[TensorRT] [fast_build] builder_optimization_level={config.builder_optimization_level}")
             except Exception as e:
-                logging.debug(f"[TensorRT] [fast_build] builder_optimization_level not available: {e}")
+                logging.debug(f"[TensorRT] [fast_build] builder_optimization_level error: {e}")
+            
             try:
-                # Restrict tactic sources to reduce timing
                 if hasattr(trt, 'TacticSource') and hasattr(config, 'set_tactic_sources'):
                     sources = 0
-                    for s in ('CUBLAS_LT',):
+                    # Add more tactic sources for better quality
+                    for s in ('CUBLAS', 'CUBLAS_LT'):  # Added CUBLAS
                         if hasattr(trt.TacticSource, s):
                             sources |= getattr(trt.TacticSource, s)
                     if sources:
                         config.set_tactic_sources(sources)
-                        logging.info("[TensorRT] [fast_build] Enabled tactic sources: cuBLASLt only")
+                        logging.info("[TensorRT] [fast_build] Enabled tactic sources: cuBLAS + cuBLASLt")
             except Exception as e:
-                logging.debug(f"[TensorRT] [fast_build] set_tactic_sources not available: {e}")
-        else:
-            # Prefer more GPU-heavy tactic search by increasing workspace and optimization level
-            try:
-                # Allow up to 12 GiB workspace on 24 GiB cards for faster tactic profiling
-                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 12 << 30)
-                logging.info("[TensorRT] Set WORKSPACE memory pool limit to 12 GiB")
-            except Exception as e:
-                logging.debug(f"[TensorRT] set_memory_pool_limit not available: {e}")
-            try:
-                # Higher optimization level increases GPU kernel search; 4 is aggressive but reasonable
-                if hasattr(config, 'builder_optimization_level'):
-                    config.builder_optimization_level = 4
-                    logging.info("[TensorRT] Set builder_optimization_level=4")
-            except Exception as e:
-                logging.debug(f"[TensorRT] builder_optimization_level not available: {e}")
-            # Enable more tactic sources so TRT can use GPU-optimized kernels broadly
-            try:
-                if hasattr(trt, 'TacticSource') and hasattr(config, 'set_tactic_sources'):
-                    sources = 0
-                    for s in ('CUBLAS', 'CUBLAS_LT', 'CUDNN'):
-                        if hasattr(trt.TacticSource, s):
-                            sources |= getattr(trt.TacticSource, s)
-                    if sources:
-                        config.set_tactic_sources(sources)
-                        logging.info("[TensorRT] Enabled tactic sources: cuBLAS/cuBLASLt/cuDNN")
-            except Exception as e:
-                logging.debug(f"[TensorRT] set_tactic_sources not available: {e}")
+                logging.debug(f"[TensorRT] [fast_build] set_tactic_sources error: {e}")
 
-        logging.info("[TensorRT] Configuring optimization profile")
+        else:
+            # PRODUCTION BUILD MODE - OPTIMIZED FOR i7-13700K + 64GB RAM + RTX 4090
+            try:
+                # MAXIMIZE workspace - 24GB VRAM, 16GB for workspace!
+                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 16 << 30)  # 16GB (increased from 12GB)
+                logging.info("[TensorRT] Set WORKSPACE to 16 GiB (maximizing 4090's 24GB VRAM)")
+            except Exception as e:
+                logging.debug(f"[TensorRT] set_memory_pool_limit error: {e}")
+            
+            try:
+                # Use Level 3 (NVIDIA recommended) instead of 4 for better time/quality balance
+                if hasattr(config, 'builder_optimization_level'):
+                    config.builder_optimization_level = 3  # Changed from 4 to 3 (RECOMMENDED)
+                    logging.info("[TensorRT] Set builder_optimization_level=3 (NVIDIA recommended)")
+            except Exception as e:
+                logging.debug(f"[TensorRT] builder_optimization_level error: {e}")
+            
+            try:
+                # Enable ALL tactic sources for maximum GPU utilization
+                if hasattr(trt, 'TacticSource') and hasattr(config, 'set_tactic_sources'):
+                    sources = 0
+                    # Add ALL available tactic sources
+                    for s in ('CUBLAS', 'CUBLAS_LT', 'CUDNN', 'EDGE_MASK_CONVOLUTIONS', 'JIT_CONVOLUTIONS'):
+                        if hasattr(trt.TacticSource, s):
+                            sources |= getattr(trt.TacticSource, s)
+                    if sources:
+                        config.set_tactic_sources(sources)
+                        logging.info("[TensorRT] Enabled ALL tactic sources for maximum GPU utilization")
+            except Exception as e:
+                logging.debug(f"[TensorRT] set_tactic_sources error: {e}")
+            
+            # OPTIONAL: Increase timing iterations for more accurate profiling
+            try:
+                if hasattr(config, 'avg_timing_iterations'):
+                    config.avg_timing_iterations = 16  # Default is 8, increase for better accuracy
+                    logging.info("[TensorRT] Set avg_timing_iterations=16 (more accurate profiling)")
+            except Exception as e:
+                logging.debug(f"[TensorRT] avg_timing_iterations error: {e}")
+            
+            # OPTIONAL: Enable profiling verbosity to see what TRT is doing
+            try:
+                if hasattr(config, 'profiling_verbosity'):
+                    config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+                    logging.info("[TensorRT] Enabled detailed profiling verbosity")
+            except Exception as e:
+                logging.debug(f"[TensorRT] profiling_verbosity error: {e}")
+
         prefix_encode = ""
         for k in range(len(input_names)):
             min_shape = inputs_shapes_min[k]
@@ -863,8 +977,6 @@ class TRT_MODEL_CONVERSION_BASE:
             if serialized_engine is None:
                 logging.error("[TensorRT] Engine serialization failed!")
                 return ()
-                
-            # logging.info(f"[TensorRT] Engine size: {len(serialized_engine)} bytes")
 
             full_output_folder, filename, counter, subfolder, filename_prefix = (
                 folder_paths.get_save_image_path(filename_prefix, self.output_dir)
@@ -1033,7 +1145,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         self,
         model,
         filename_prefix,
-    fast_build,
+        fast_build,
         batch_size_min,
         batch_size_opt,
         batch_size_max,
@@ -1132,7 +1244,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         self,
         model,
         filename_prefix,
-    fast_build,
+        fast_build,
         batch_size_opt,
         height_opt,
         width_opt,

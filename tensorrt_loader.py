@@ -51,54 +51,64 @@ class TrTUnet:
     def __call__(self, x, timesteps, context, y=None, control=None, transformer_options=None, **kwargs):
         model_inputs = {"x": x, "timesteps": timesteps, "context": context}
 
-        # Align context's feature dimension with engine expectation (e.g., 2048 for Lumina2)
+        # FIXED: Proper context handling without incorrect padding
+        # For Lumina2, context should already be the correct dimension (2304) from text encoder
+        # No need to pad or truncate - just validate
         try:
             ctx_name = "context"
             if ctx_name in model_inputs:
-                # Profile ranges provide concrete min/opt/max values per dim
+                # Get engine's expected shape from profile
                 prof_min, prof_opt, prof_max = self.engine.get_tensor_profile_shape(ctx_name, 0)
-                # Shapes are (B, L, C) for context
+                
+                ctx = model_inputs[ctx_name]
+                B, L, C = ctx.shape
+                
+                # Validate feature dimension matches
+                expected_feat = prof_min[2] if len(prof_min) >= 3 else None
+                if expected_feat is not None and expected_feat != -1 and C != expected_feat:
+                    raise ValueError(f"Context feature dimension mismatch: got {C}, expected {expected_feat}")
+                
+                # Handle sequence length by padding/truncating if needed
                 min_len = prof_min[1] if len(prof_min) >= 2 else None
                 max_len = prof_max[1] if len(prof_max) >= 2 else None
-                expected_feat = prof_min[2] if len(prof_min) >= 3 else None
-
-                ctx = model_inputs[ctx_name]
-                # 1) Fix feature dimension C to expected (e.g., 2048)
-                if expected_feat is not None and expected_feat != -1:
-                    actual_feat = ctx.shape[-1]
-                    if actual_feat != expected_feat:
-                        if actual_feat > expected_feat:
-                            ctx = ctx[..., :expected_feat]
-                        else:
-                            pad_c = expected_feat - actual_feat
-                            ctx = torch.nn.functional.pad(ctx, (0, pad_c), mode="constant", value=0)
-
-                # 2) Clamp/pad sequence length L into [min_len, max_len]
+                
                 if (min_len is not None and min_len != -1) or (max_len is not None and max_len != -1):
-                    B, L, C = ctx.shape[0], ctx.shape[1], ctx.shape[2]
-                    # Truncate if longer than allowed
+                    # Truncate if longer than max
                     if max_len is not None and max_len != -1 and L > max_len:
                         ctx = ctx[:, :max_len, :]
                         L = max_len
-                    # Pad if shorter than allowed
+                    # Pad if shorter than min
                     if min_len is not None and min_len != -1 and L < min_len:
                         pad_L = min_len - L
-                        # Repeat the last valid token instead of zeros to reduce artifacts
-                        last_tok = ctx[:, L - 1:L, :]
-                        pad_tensor = last_tok.expand(B, pad_L, C)
+                        # Use zero padding for simplicity
+                        pad_tensor = torch.zeros(B, pad_L, C, dtype=ctx.dtype, device=ctx.device)
                         ctx = torch.cat([ctx, pad_tensor], dim=1)
 
                 model_inputs[ctx_name] = ctx.contiguous()
-        except Exception:
+        except Exception as e:
             # Best-effort; if inspection fails, continue and let TRT report a clear error
+            print(f"Warning: Context shape adjustment failed: {e}")
             pass
 
         if y is not None:
             model_inputs["y"] = y
 
+        # # FIXED: Handle num_tokens for Lumina2
+        # num_tokens = kwargs.get("num_tokens", None)
+        # if num_tokens is not None:
+        #     # num_tokens should be a scalar or 1D tensor
+        #     if isinstance(num_tokens, int):
+        #         num_tokens = torch.tensor([num_tokens], dtype=torch.int32, device=x.device)
+        #     elif isinstance(num_tokens, torch.Tensor):
+        #         if num_tokens.dim() == 0:
+        #             num_tokens = num_tokens.unsqueeze(0)
+        #         num_tokens = num_tokens.to(dtype=torch.int32, device=x.device)
+        #     model_inputs["num_tokens"] = num_tokens
+
         for i in range(len(model_inputs), self.engine.num_io_tensors - 1):
             name = self.engine.get_tensor_name(i)
-            model_inputs[name] = kwargs[name]
+            if name in kwargs:
+                model_inputs[name] = kwargs[name]
 
         batch_size = x.shape[0]
         dims = self.engine.get_tensor_profile_shape(self.engine.get_tensor_name(0), 0)
@@ -139,8 +149,8 @@ class TrTUnet:
         stream = torch.cuda.default_stream(x.device)
         for i in range(curr_split_batch):
             for k in model_inputs_converted:
-                x = model_inputs_converted[k]
-                self.context.set_tensor_address(k, x[(x.shape[0] // curr_split_batch) * i:].data_ptr())
+                x_input = model_inputs_converted[k]
+                self.context.set_tensor_address(k, x_input[(x_input.shape[0] // curr_split_batch) * i:].data_ptr())
             self.context.execute_async_v3(stream_handle=stream.cuda_stream)
         # stream.synchronize() #don't need to sync stream since it's the default torch one
         return out
@@ -207,11 +217,12 @@ class TensorRTLoader:
             model = conf.get_model({})
             unet.dtype = torch.bfloat16 #TODO: autodetect
         elif model_type == "lumina2":
+            # FIXED: Proper Lumina2 configuration
             from comfy.supported_models import Lumina2 as Lumina2Config
             conf = Lumina2Config({})
             conf.unet_config["disable_unet_model_creation"] = True
             model = conf.get_model({})
-            unet.dtype = torch.bfloat16  # Match ComfyUI default
+            unet.dtype = torch.bfloat16  # Match Lumina2 default
         model.diffusion_model = unet
         model.memory_required = lambda *args, **kwargs: 0 #always pass inputs batched up as much as possible, our TRT code will handle batch splitting
 
