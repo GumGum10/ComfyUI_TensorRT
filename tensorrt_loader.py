@@ -93,6 +93,15 @@ class TrTUnet:
                 
                 ctx = model_inputs[ctx_name]
                 B, L, C = ctx.shape
+
+                # HARD GUARD: If the engine was built with seq_len==1, abort with a clear message.
+                # Running with L==1 will drop almost all text conditioning and cause artifacts (banding/lines).
+                if (prof_max[1] == 1) or (prof_opt[1] == 1):
+                    raise RuntimeError(
+                        "TensorRT engine was built with context_max==1. "
+                        "This collapses the text sequence to a single token and causes severe artifacts. "
+                        "Please rebuild the engine with context_min>=3, context_opt>=137, context_max>=512 (or higher)."
+                    )
                 
                 # Validate feature dimension matches
                 expected_feat = prof_min[2] if len(prof_min) >= 3 else None

@@ -511,6 +511,8 @@ class TRT_MODEL_CONVERSION_BASE:
             
             # Use actual Gemma2-2B embedding dimension
             context_dim = 2304
+            # Use dynamic sequence length. We'll still keep the multiplier semantics below,
+            # but auto-bump the ranges if the user left the defaults at 1 to avoid broken engines.
             context_len_min = 1
             context_len = 1
             
@@ -545,18 +547,148 @@ class TRT_MODEL_CONVERSION_BASE:
             }
 
             transformer_options = model.model_options['transformer_options'].copy()
-            
-            # LUMINA2: CRITICAL FIX - Patch unpatchify BEFORE ONNX export to prevent artifacts
+
+            # Auto-bump context profile ranges for Lumina2 if left at defaults.
+            # Engines built with context_{min,opt,max}=1 will force seq_len==1 and the loader
+            # will truncate captions to a single token, causing severe artifacts.
             if is_lumina2:
-                logging.info("[TensorRT] Patching Lumina2 unpatchify for TensorRT-safe compilation...")
+                orig_ctx = (context_min, context_opt, context_max)
+                rec_min, rec_opt, rec_max = 3, 137, 512
+                # Only bump when clearly unset (<=1). Preserve explicit user choices >1.
+                context_min = max(rec_min, context_min) if context_min <= 1 else context_min
+                context_opt = max(rec_opt, context_opt) if context_opt <= 1 else context_opt
+                context_max = max(rec_max, context_max) if context_max <= 1 else context_max
+                # Ensure ordering min <= opt <= max
+                context_opt = max(context_min, context_opt)
+                context_max = max(context_opt, context_max)
+                if orig_ctx != (context_min, context_opt, context_max):
+                    logging.warning(
+                        f"[TensorRT][Lumina2] Auto-adjusted context profile from {orig_ctx} to "
+                        f"(min,opt,max)=({context_min},{context_opt},{context_max}). "
+                        "To override, set values explicitly in the node."
+                    )
+            
+            # LUMINA2: CRITICAL FIX - Patch BOTH patchify and unpatchify BEFORE ONNX export
+            if is_lumina2:
+                logging.info("[TensorRT] Patching Lumina2 patchify_and_embed for TensorRT-safe compilation...")
                 
-                # Store original method
+                # Store original methods
+                import types
+                _original_patchify_and_embed = unet.patchify_and_embed
                 _original_unpatchify = unet.unpatchify
+                
+                def safe_patchify_and_embed(self, x, cap_feats, cap_mask, t, num_tokens):
+                    """
+                    TensorRT-safe patchify using .reshape() instead of .view()
+                    This is a partial override - we only fix the critical .view() operation
+                    """
+                    # Call most of the original logic by duplicating it with the fix
+                    bsz = len(x)
+                    pH = pW = self.patch_size
+                    device = x[0].device
+                    dtype = x[0].dtype
+
+                    if cap_mask is not None:
+                        l_effective_cap_len = cap_mask.sum(dim=1).tolist()
+                    else:
+                        l_effective_cap_len = [num_tokens] * bsz
+
+                    if cap_mask is not None and not torch.is_floating_point(cap_mask):
+                        cap_mask = (cap_mask - 1).to(dtype) * torch.finfo(dtype).max
+
+                    img_sizes = [(img.size(1), img.size(2)) for img in x]
+                    l_effective_img_len = [(H // pH) * (W // pW) for (H, W) in img_sizes]
+
+                    max_seq_len = max(
+                        (cap_len+img_len for cap_len, img_len in zip(l_effective_cap_len, l_effective_img_len))
+                    )
+                    max_cap_len = max(l_effective_cap_len)
+                    max_img_len = max(l_effective_img_len)
+
+                    position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
+
+                    for i in range(bsz):
+                        cap_len = l_effective_cap_len[i]
+                        img_len = l_effective_img_len[i]
+                        H, W = img_sizes[i]
+                        H_tokens, W_tokens = H // pH, W // pW  # CRITICAL FIX: W_tokens must use pW not pH!
+                        assert H_tokens * W_tokens == img_len
+
+                        position_ids[i, :cap_len, 0] = torch.arange(cap_len, dtype=torch.int32, device=device)
+                        position_ids[i, cap_len:cap_len+img_len, 0] = cap_len
+                        row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
+                        col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
+                        position_ids[i, cap_len:cap_len+img_len, 1] = row_ids
+                        position_ids[i, cap_len:cap_len+img_len, 2] = col_ids
+
+                    freqs_cis = self.rope_embedder(position_ids).movedim(1, 2).to(dtype)
+
+                    cap_freqs_cis_shape = list(freqs_cis.shape)
+                    cap_freqs_cis_shape[1] = cap_feats.shape[1]
+                    cap_freqs_cis = torch.zeros(*cap_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
+
+                    img_freqs_cis_shape = list(freqs_cis.shape)
+                    img_freqs_cis_shape[1] = max_img_len
+                    img_freqs_cis = torch.zeros(*img_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
+
+                    for i in range(bsz):
+                        cap_len = l_effective_cap_len[i]
+                        img_len = l_effective_img_len[i]
+                        cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
+                        img_freqs_cis[i, :img_len] = freqs_cis[i, cap_len:cap_len+img_len]
+
+                    for layer in self.context_refiner:
+                        cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
+
+                    # CRITICAL FIX: Use einsum instead of permute (like SD3/Flux)
+                    flat_x = []
+                    for i in range(bsz):
+                        img = x[i]
+                        C, H, W = img.size()
+                        # ORIGINAL: img.view(C, H // pH, pH, W // pW, pW).permute(1, 3, 2, 4, 0).flatten(2).flatten(0, 1)
+                        # FIXED: Use einsum for TensorRT-safe compilation
+                        # Reshape to 5D: [C, H_patches, pH, W_patches, pW]
+                        img_5d = img.reshape(C, H // pH, pH, W // pW, pW)
+                        # Dimension mapping: [C, h, p_h, w, p_w] -> permute(1,3,2,4,0) -> [h, w, p_h, p_w, C]
+                        # In einsum: chpwq (where q=p_w) -> hwpqc
+                        img_reordered = torch.einsum('chpwq->hwpqc', img_5d)
+                        # Flatten: [h,w,p_h,p_w,C] -> flatten(2) -> [h,w,p_h*p_w*C] -> flatten(0,1) -> [h*w, p_h*p_w*C]
+                        img = img_reordered.flatten(2).flatten(0, 1)
+                        flat_x.append(img)
+                    x = flat_x
+                    
+                    padded_img_embed = torch.zeros(bsz, max_img_len, x[0].shape[-1], device=device, dtype=x[0].dtype)
+                    padded_img_mask = torch.zeros(bsz, max_img_len, dtype=dtype, device=device)
+                    for i in range(bsz):
+                        padded_img_embed[i, :l_effective_img_len[i]] = x[i]
+                        padded_img_mask[i, l_effective_img_len[i]:] = -torch.finfo(dtype).max
+
+                    padded_img_embed = self.x_embedder(padded_img_embed)
+                    padded_img_mask = padded_img_mask.unsqueeze(1)
+                    for layer in self.noise_refiner:
+                        padded_img_embed = layer(padded_img_embed, padded_img_mask, img_freqs_cis, t)
+
+                    if cap_mask is not None:
+                        mask = torch.zeros(bsz, max_seq_len, dtype=dtype, device=device)
+                        mask[:, :max_cap_len] = cap_mask[:, :max_cap_len]
+                    else:
+                        mask = None
+
+                    padded_full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x[0].dtype)
+                    for i in range(bsz):
+                        cap_len = l_effective_cap_len[i]
+                        img_len = l_effective_img_len[i]
+                        padded_full_embed[i, :cap_len] = cap_feats[i, :cap_len]
+                        padded_full_embed[i, cap_len:cap_len+img_len] = padded_img_embed[i, :img_len]
+                        if mask is not None:
+                            mask[i, cap_len+img_len:] = -torch.finfo(dtype).max
+
+                    return padded_full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
                 
                 def safe_unpatchify(self, x, img_size, cap_size, return_tensor=False):
                     """
-                    TensorRT-safe unpatchify using .reshape() + .contiguous()
-                    This prevents vertical line artifacts from non-contiguous tensors
+                    TensorRT-safe unpatchify using einsum (like SD3/Flux) instead of permute
+                    This prevents vertical line artifacts from TensorRT's permute optimization issues
                     """
                     pH = pW = self.patch_size
                     imgs = []
@@ -565,36 +697,44 @@ class TRT_MODEL_CONVERSION_BASE:
                         begin = cap_size[i]
                         end = begin + (H // pH) * (W // pW)
                         
-                        # CRITICAL FIXES:
-                        # 1. Force contiguous BEFORE reshape
-                        # 2. Use .reshape() instead of .view()
-                        # 3. Force contiguous AFTER permute
-                        patches = x[i][begin:end].contiguous()
+                        patches = x[i][begin:end]
                         
-                        imgs.append(
-                            patches
-                            .reshape(H // pH, W // pW, pH, pW, self.out_channels)  # ← Safe for TensorRT
-                            .permute(4, 0, 2, 1, 3)  # Reorder dimensions
-                            .contiguous()            # ← Ensure contiguous after permute
-                            .flatten(3, 4)           # Flatten width
-                            .flatten(1, 2)           # Flatten height
-                        )
+                        # CRITICAL: Use einsum like SD3/Flux instead of permute
+                        # TensorRT handles einsum better than permute for complex reshapes
+                        # Original:  .view().permute(4,0,2,1,3).flatten(3,4).flatten(1,2)
+                        # New:       .reshape().einsum().flatten()
+                        
+                        # Reshape to 5D: [H_patches, W_patches, pH, pW, C]
+                        patches_5d = patches.reshape(H // pH, W // pW, pH, pW, self.out_channels)
+                        
+                        # Original permute(4,0,2,1,3) means: [C, H_patches, pH, W_patches, pW]
+                        # With einsum notation without batch: hwpqc -> chpwq
+                        # But wait - permute(4,0,2,1,3) on [h,w,p,q,c] gives [c,h,p,w,q]!
+                        # Let me map: dim0=h, dim1=w, dim2=p, dim3=q, dim4=c
+                        # permute(4,0,2,1,3) = [dim4, dim0, dim2, dim1, dim3] = [c, h, p, w, q]
+                        patches_reordered = torch.einsum('hwpqc->chpwq', patches_5d)
+                        
+                        # Now flatten: [c,h,p,w,q] -> flatten(3,4) -> [c,h,p,w*q] -> flatten(1,2) -> [c,h*p,w*q]
+                        # But we want [c, H, W] where H=h*p, W=w*q
+                        # So: [c,h,p,w,q] -> [c, h*p, w*q]
+                        img = patches_reordered.flatten(3, 4).flatten(1, 2)
+                        imgs.append(img)
                     
                     if return_tensor:
                         imgs = torch.stack(imgs, dim=0)
                     return imgs
                 
-                # Apply the patch by replacing the method
-                import types
+                # Apply the patches
+                unet.patchify_and_embed = types.MethodType(safe_patchify_and_embed, unet)
                 unet.unpatchify = types.MethodType(safe_unpatchify, unet)
-                logging.info("[TensorRT] ✅ Patched unpatchify for TensorRT-safe compilation (view→reshape+contiguous)")
+                logging.info("[TensorRT] ✅ Patched BOTH patchify AND unpatchify using EINSUM (like SD3/Flux) for TensorRT compatibility")
                 
             # LUMINA2: Wrap model now that we have transformer_options
             if is_lumina2:
                 class Lumina2ONNXWrapper(torch.nn.Module):
                     """
                     ONNX-compatible wrapper for Lumina2 with DYNAMIC shape support
-                    Uses the patched unpatchify (reshape+contiguous) to prevent artifacts
+                    Uses einsum-based patchify/unpatchify (like SD3/Flux) for TensorRT compatibility
                     """
                     def __init__(self, unet, transformer_options):
                         super().__init__()
@@ -611,7 +751,7 @@ class TRT_MODEL_CONVERSION_BASE:
                         # CRITICAL: Use context.shape[1] - this preserves dynamic dimension
                         num_tokens = context.shape[1]
                         
-                        # Call original model (which now has patched unpatchify)
+                        # Call original model (which now has patched patchify AND unpatchify)
                         return self.unet(
                             x,
                             timesteps,
@@ -624,7 +764,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 # Wrap the model
                 unet = Lumina2ONNXWrapper(unet, transformer_options)
                 logging.info("[TensorRT] Wrapped Lumina2 model with DYNAMIC SHAPE ONNX wrapper")
-                logging.info("[TensorRT]    Using patched unpatchify (reshape+contiguous) for artifact-free compilation")
+                logging.info("[TensorRT]    Using EINSUM-based patchify/unpatchify (SD3/Flux approach) for TensorRT")
 
             
             if model.model.model_config.unet_config.get(
