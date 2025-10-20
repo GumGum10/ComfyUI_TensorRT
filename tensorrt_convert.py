@@ -511,8 +511,8 @@ class TRT_MODEL_CONVERSION_BASE:
             
             # Use actual Gemma2-2B embedding dimension
             context_dim = 2304
-            context_len_min = 512
-            context_len = 512
+            context_len_min = 1
+            context_len = 1
             
             y_dim = 0
             dtype = torch.bfloat16
@@ -521,6 +521,11 @@ class TRT_MODEL_CONVERSION_BASE:
             # CRITICAL FIX: Don't add num_tokens as a dynamic input
             # Instead, we'll wrap the model to use context.shape[1] as num_tokens
             extra_input = {}  # Changed from {"num_tokens": ()}
+            logging.info(f"[TensorRT] Lumina2 Configuration:")
+            logging.info(f"[TensorRT] - Context Dimension: {context_dim}")
+            logging.info(f"[TensorRT] - Context will be: context_len * context_opt tokens")
+            logging.info(f"[TensorRT] - Recommended: context_min=3, context_opt=137, context_max=512")
+
             
             logging.info(f"[TensorRT] Lumina2 Configuration:")
             logging.info(f"[TensorRT] - Context Dimension: {context_dim}")
@@ -541,11 +546,55 @@ class TRT_MODEL_CONVERSION_BASE:
 
             transformer_options = model.model_options['transformer_options'].copy()
             
+            # LUMINA2: CRITICAL FIX - Patch unpatchify BEFORE ONNX export to prevent artifacts
+            if is_lumina2:
+                logging.info("[TensorRT] Patching Lumina2 unpatchify for TensorRT-safe compilation...")
+                
+                # Store original method
+                _original_unpatchify = unet.unpatchify
+                
+                def safe_unpatchify(self, x, img_size, cap_size, return_tensor=False):
+                    """
+                    TensorRT-safe unpatchify using .reshape() + .contiguous()
+                    This prevents vertical line artifacts from non-contiguous tensors
+                    """
+                    pH = pW = self.patch_size
+                    imgs = []
+                    for i in range(x.size(0)):
+                        H, W = img_size[i]
+                        begin = cap_size[i]
+                        end = begin + (H // pH) * (W // pW)
+                        
+                        # CRITICAL FIXES:
+                        # 1. Force contiguous BEFORE reshape
+                        # 2. Use .reshape() instead of .view()
+                        # 3. Force contiguous AFTER permute
+                        patches = x[i][begin:end].contiguous()
+                        
+                        imgs.append(
+                            patches
+                            .reshape(H // pH, W // pW, pH, pW, self.out_channels)  # ← Safe for TensorRT
+                            .permute(4, 0, 2, 1, 3)  # Reorder dimensions
+                            .contiguous()            # ← Ensure contiguous after permute
+                            .flatten(3, 4)           # Flatten width
+                            .flatten(1, 2)           # Flatten height
+                        )
+                    
+                    if return_tensor:
+                        imgs = torch.stack(imgs, dim=0)
+                    return imgs
+                
+                # Apply the patch by replacing the method
+                import types
+                unet.unpatchify = types.MethodType(safe_unpatchify, unet)
+                logging.info("[TensorRT] ✅ Patched unpatchify for TensorRT-safe compilation (view→reshape+contiguous)")
+                
             # LUMINA2: Wrap model now that we have transformer_options
             if is_lumina2:
                 class Lumina2ONNXWrapper(torch.nn.Module):
                     """
-                    ONNX-compatible wrapper for Lumina2 that derives num_tokens from context shape
+                    ONNX-compatible wrapper for Lumina2 with DYNAMIC shape support
+                    Uses the patched unpatchify (reshape+contiguous) to prevent artifacts
                     """
                     def __init__(self, unet, transformer_options):
                         super().__init__()
@@ -557,13 +606,12 @@ class TRT_MODEL_CONVERSION_BASE:
                         Args:
                             x: [B, C, H, W] latent tensor
                             timesteps: [B] timestep tensor  
-                            context: [B, L, D] text embeddings
+                            context: [B, L, D] text embeddings - L is DYNAMIC!
                         """
-                        # Derive num_tokens from context sequence length
-                        # This makes it a constant in the ONNX graph based on the input shape
+                        # CRITICAL: Use context.shape[1] - this preserves dynamic dimension
                         num_tokens = context.shape[1]
                         
-                        # Call original model
+                        # Call original model (which now has patched unpatchify)
                         return self.unet(
                             x,
                             timesteps,
@@ -575,7 +623,9 @@ class TRT_MODEL_CONVERSION_BASE:
                 
                 # Wrap the model
                 unet = Lumina2ONNXWrapper(unet, transformer_options)
-                logging.info("[TensorRT] Wrapped Lumina2 model with ONNX-compatible wrapper")
+                logging.info("[TensorRT] Wrapped Lumina2 model with DYNAMIC SHAPE ONNX wrapper")
+                logging.info("[TensorRT]    Using patched unpatchify (reshape+contiguous) for artifact-free compilation")
+
             
             if model.model.model_config.unet_config.get(
                 "use_temporal_resblock", False
@@ -1107,7 +1157,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                     {
                         "default": 1,
                         "min": 1,
-                        "max": 128,
+                        "max": 512,
                         "step": 1,
                     },
                 ),
@@ -1116,7 +1166,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                     {
                         "default": 1,
                         "min": 1,
-                        "max": 128,
+                        "max": 512,
                         "step": 1,
                     },
                 ),
@@ -1125,7 +1175,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                     {
                         "default": 1,
                         "min": 1,
-                        "max": 128,
+                        "max": 512,
                         "step": 1,
                     },
                 ),
