@@ -315,7 +315,7 @@ class TRT_MODEL_CONVERSION_BASE:
             verbose=False,
             input_names=input_names,
             output_names=output_names,
-            opset_version=17,
+            opset_version=None,
             dynamic_axes=dynamic_axes,
         )
 
