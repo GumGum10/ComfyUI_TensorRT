@@ -186,10 +186,7 @@ class TRT_MODEL_CONVERSION_BASE:
             context_len_min = 256
             context_len = 256
             y_dim = 0  # Lumina2 doesn't use y embeddings
-            # For Lumina2, num_tokens and attention_mask will be baked into the model
-            # as constants during ONNX export (one engine per configuration)
             extra_input = {}  # Don't add as dynamic inputs
-            # Force model to bfloat16
             model.model.diffusion_model.to(torch.bfloat16)
             dtype = torch.bfloat16            
 
@@ -269,7 +266,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 inputs_shapes_min = (
                     (batch_size_min, input_channels, height_min // 8, width_min // 8),
                     (batch_size_min,),
-                    (batch_size_min, context_len_min * 1, context_dim),
+                    (batch_size_min, 16, context_dim),
                 )
                 inputs_shapes_opt = (
                     (batch_size_opt, input_channels, height_opt // 8, width_opt // 8),
@@ -364,7 +361,7 @@ class TRT_MODEL_CONVERSION_BASE:
         self._setup_timing_cache(config)
         config.progress_monitor = TQDMProgressMonitor()
         ## DEBUG -> TO REMOVE LATER
-        config.builder_optimization_level = 0
+        config.builder_optimization_level = 3
 
         prefix_encode = ""
         for k in range(len(input_names)):
@@ -388,35 +385,34 @@ class TRT_MODEL_CONVERSION_BASE:
         # This prevents quantization artifacts at the boundaries
         print("Setting precision constraints for input and output layers...")
         
-        # Mark input layers to use high precision (no quantization)
-        for i in range(network.num_inputs):
-            input_tensor = network.get_input(i)
-            input_name = input_tensor.name
+        # UNCOMMENT IF WORKING WITH QUANTIZATION
+        # for i in range(network.num_inputs):
+        #     input_tensor = network.get_input(i)
+        #     input_name = input_tensor.name
             
-            # Skip timesteps
-            if 'timestep' in input_name.lower():
-                print(f"  Input '{input_name}': skipped (timesteps remain float32)")
-                continue
-            input_tensor.allowed_formats = 1 << int(trt.TensorFormat.LINEAR)
-            if dtype == torch.float16:
-                input_tensor.dtype = trt.DataType.HALF
-            elif dtype == torch.bfloat16:
-                input_tensor.dtype = trt.DataType.BF16
-            else:
-                input_tensor.dtype = trt.DataType.FLOAT
-            print(f"  Input '{input_tensor.name}': forced to {input_tensor.dtype}")
+        #     # Skip timesteps
+        #     if 'timestep' in input_name.lower():
+        #         print(f"  Input '{input_name}': skipped (timesteps remain float32)")
+        #         continue
+        #     input_tensor.allowed_formats = 1 << int(trt.TensorFormat.LINEAR)
+        #     if dtype == torch.float16:
+        #         input_tensor.dtype = trt.DataType.HALF
+        #     elif dtype == torch.bfloat16:
+        #         input_tensor.dtype = trt.DataType.BF16
+        #     else:
+        #         input_tensor.dtype = trt.DataType.FLOAT
+        #     print(f"  Input '{input_tensor.name}': forced to {input_tensor.dtype}")
         
-        # Mark output layers to use high precision (no quantization)
-        for i in range(network.num_outputs):
-            output_tensor = network.get_output(i)
-            output_tensor.allowed_formats = 1 << int(trt.TensorFormat.LINEAR)
-            if dtype == torch.float16:
-                output_tensor.dtype = trt.DataType.HALF
-            elif dtype == torch.bfloat16:
-                output_tensor.dtype = trt.DataType.BF16
-            else:
-                output_tensor.dtype = trt.DataType.FLOAT
-            print(f"  Output '{output_tensor.name}': forced to {output_tensor.dtype}")
+        # for i in range(network.num_outputs):
+        #     output_tensor = network.get_output(i)
+        #     output_tensor.allowed_formats = 1 << int(trt.TensorFormat.LINEAR)
+        #     if dtype == torch.float16:
+        #         output_tensor.dtype = trt.DataType.HALF
+        #     elif dtype == torch.bfloat16:
+        #         output_tensor.dtype = trt.DataType.BF16
+        #     else:
+        #         output_tensor.dtype = trt.DataType.FLOAT
+        #     print(f"  Output '{output_tensor.name}': forced to {output_tensor.dtype}")
 
         config.add_optimization_profile(profile)
 
