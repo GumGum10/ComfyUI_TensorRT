@@ -265,22 +265,39 @@ class TRT_MODEL_CONVERSION_BASE:
                 unet = _unet
 
             input_channels = model.model.model_config.unet_config.get("in_channels", 4)
-
-            inputs_shapes_min = (
-                (batch_size_min, input_channels, height_min // 8, width_min // 8),
-                (batch_size_min,),
-                (batch_size_min, context_len_min * context_min, context_dim),
-            )
-            inputs_shapes_opt = (
-                (batch_size_opt, input_channels, height_opt // 8, width_opt // 8),
-                (batch_size_opt,),
-                (batch_size_opt, context_len * context_opt, context_dim),
-            )
-            inputs_shapes_max = (
-                (batch_size_max, input_channels, height_max // 8, width_max // 8),
-                (batch_size_max,),
-                (batch_size_max, context_len * context_max, context_dim),
-            )
+            if(isinstance(model.model, comfy.model_base.Lumina2)):
+                inputs_shapes_min = (
+                    (batch_size_min, input_channels, height_min // 8, width_min // 8),
+                    (batch_size_min,),
+                    (batch_size_min, context_len_min * 1, context_dim),
+                )
+                inputs_shapes_opt = (
+                    (batch_size_opt, input_channels, height_opt // 8, width_opt // 8),
+                    (batch_size_opt,),
+                    (batch_size_opt, context_len, context_dim),
+                )
+                inputs_shapes_max = (
+                    (batch_size_max, input_channels, height_max // 8, width_max // 8),
+                    (batch_size_max,),
+                    (batch_size_max, context_len * 2, context_dim),
+                )
+  
+            else:
+                inputs_shapes_min = (
+                    (batch_size_min, input_channels, height_min // 8, width_min // 8),
+                    (batch_size_min,),
+                    (batch_size_min, context_len_min * context_min, context_dim),
+                )
+                inputs_shapes_opt = (
+                    (batch_size_opt, input_channels, height_opt // 8, width_opt // 8),
+                    (batch_size_opt,),
+                    (batch_size_opt, context_len * context_opt, context_dim),
+                )
+                inputs_shapes_max = (
+                    (batch_size_max, input_channels, height_max // 8, width_max // 8),
+                    (batch_size_max,),
+                    (batch_size_max, context_len * context_max, context_dim),
+                )
 
             if y_dim > 0:
                 input_names.append("y")
