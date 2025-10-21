@@ -41,6 +41,7 @@ class TrTUnet:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
         self.dtype = torch.float16
+        self.stream = None  # Will be created on first use for the specific device
 
     def set_bindings_shape(self, inputs, split_batch):
         for k in inputs:
@@ -101,13 +102,19 @@ class TrTUnet:
                           dtype=trt_datatype_to_torch(self.engine.get_tensor_dtype(output_binding_name)))
         model_inputs_converted[output_binding_name] = out
 
-        stream = torch.cuda.default_stream(x.device)
+        # Create a non-default CUDA stream for better performance
+        # This eliminates TensorRT's warning about using default stream
+        if self.stream is None or self.stream.device != x.device:
+            self.stream = torch.cuda.Stream(x.device)
+        
         for i in range(curr_split_batch):
             for k in model_inputs_converted:
                 x = model_inputs_converted[k]
                 self.context.set_tensor_address(k, x[(x.shape[0] // curr_split_batch) * i:].data_ptr())
-            self.context.execute_async_v3(stream_handle=stream.cuda_stream)
-        # stream.synchronize() #don't need to sync stream since it's the default torch one
+            self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
+        
+        # Synchronize the stream to ensure all operations complete before returning
+        self.stream.synchronize()
         return out
 
     def load_state_dict(self, sd, strict=False):
