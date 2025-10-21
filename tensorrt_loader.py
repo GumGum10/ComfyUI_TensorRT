@@ -2,21 +2,12 @@
 
 import torch
 import os
-import logging
 
 import comfy.model_base
 import comfy.model_management
 import comfy.model_patcher
 import comfy.supported_models
 import folder_paths
-
-# Import VAE debug hook
-try:
-    from .vae_debug_hook import get_vae_debug_hook
-    VAE_DEBUG_AVAILABLE = True
-except ImportError:
-    VAE_DEBUG_AVAILABLE = False
-    logging.warning("[TensorRT] VAE debug hook not available")
 
 if "tensorrt" in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["tensorrt"][0].append(
@@ -60,94 +51,18 @@ class TrTUnet:
     def __call__(self, x, timesteps, context, y=None, control=None, transformer_options=None, **kwargs):
         model_inputs = {"x": x, "timesteps": timesteps, "context": context}
 
-        print(f"\n{'='*60}")
-        print(f"[TensorRT Loader Debug]")
-        print(f"Input context shape: {context.shape}")
-        print(f"Expected by engine:")
-
-        # Add these lines:
-        try:
-            prof_min, prof_opt, prof_max = self.engine.get_tensor_profile_shape("context", 0)
-            print(f"  Min: {prof_min}")
-            print(f"  Opt: {prof_opt}")
-            print(f"  Max: {prof_max}")
-        except Exception as e:
-            print(f"  Error: {e}")
-
-        print(f"{'='*60}\n")
-        # DEBUG: Print what we're actually receiving
-        print(f"\n{'='*60}")
-        print(f"[TensorRT Loader Debug]")
-        print(f"Input context shape: {context.shape}")  # What we receive
-        print(f"Expected by engine:")
-
-
-        # FIXED: Proper context handling without incorrect padding
-        # For Lumina2, context should already be the correct dimension (2304) from text encoder
-        # No need to pad or truncate - just validate
-        try:
-            ctx_name = "context"
-            if ctx_name in model_inputs:
-                # Get engine's expected shape from profile
-                prof_min, prof_opt, prof_max = self.engine.get_tensor_profile_shape(ctx_name, 0)
-                
-                ctx = model_inputs[ctx_name]
-                B, L, C = ctx.shape
-
-                # HARD GUARD: If the engine was built with seq_len==1, abort with a clear message.
-                # Running with L==1 will drop almost all text conditioning and cause artifacts (banding/lines).
-                if (prof_max[1] == 1) or (prof_opt[1] == 1):
-                    raise RuntimeError(
-                        "TensorRT engine was built with context_max==1. "
-                        "This collapses the text sequence to a single token and causes severe artifacts. "
-                        "Please rebuild the engine with context_min>=3, context_opt>=137, context_max>=512 (or higher)."
-                    )
-                
-                # Validate feature dimension matches
-                expected_feat = prof_min[2] if len(prof_min) >= 3 else None
-                if expected_feat is not None and expected_feat != -1 and C != expected_feat:
-                    raise ValueError(f"Context feature dimension mismatch: got {C}, expected {expected_feat}")
-                
-                # Handle sequence length by padding/truncating if needed
-                min_len = prof_min[1] if len(prof_min) >= 2 else None
-                max_len = prof_max[1] if len(prof_max) >= 2 else None
-                
-                if (min_len is not None and min_len != -1) or (max_len is not None and max_len != -1):
-                    # Truncate if longer than max
-                    if max_len is not None and max_len != -1 and L > max_len:
-                        ctx = ctx[:, :max_len, :]
-                        L = max_len
-                    # Pad if shorter than min
-                    if min_len is not None and min_len != -1 and L < min_len:
-                        pad_L = min_len - L
-                        # Use zero padding for simplicity
-                        pad_tensor = torch.zeros(B, pad_L, C, dtype=ctx.dtype, device=ctx.device)
-                        ctx = torch.cat([ctx, pad_tensor], dim=1)
-
-                model_inputs[ctx_name] = ctx.contiguous()
-        except Exception as e:
-            # Best-effort; if inspection fails, continue and let TRT report a clear error
-            print(f"Warning: Context shape adjustment failed: {e}")
-            pass
-
         if y is not None:
             model_inputs["y"] = y
-
-        # # FIXED: Handle num_tokens for Lumina2
-        # num_tokens = kwargs.get("num_tokens", None)
-        # if num_tokens is not None:
-        #     # num_tokens should be a scalar or 1D tensor
-        #     if isinstance(num_tokens, int):
-        #         num_tokens = torch.tensor([num_tokens], dtype=torch.int32, device=x.device)
-        #     elif isinstance(num_tokens, torch.Tensor):
-        #         if num_tokens.dim() == 0:
-        #             num_tokens = num_tokens.unsqueeze(0)
-        #         num_tokens = num_tokens.to(dtype=torch.int32, device=x.device)
-        #     model_inputs["num_tokens"] = num_tokens
 
         for i in range(len(model_inputs), self.engine.num_io_tensors - 1):
             name = self.engine.get_tensor_name(i)
             if name in kwargs:
+                # For Lumina2 num_tokens: convert to tensor if it's a scalar
+                if name == "num_tokens" and not isinstance(kwargs[name], torch.Tensor):
+                    model_inputs[name] = torch.tensor([kwargs[name]] * x.shape[0], device=x.device, dtype=torch.int32)
+                else:
+                    model_inputs[name] = kwargs[name]
+            else:
                 model_inputs[name] = kwargs[name]
 
         batch_size = x.shape[0]
@@ -189,70 +104,11 @@ class TrTUnet:
         stream = torch.cuda.default_stream(x.device)
         for i in range(curr_split_batch):
             for k in model_inputs_converted:
-                x_input = model_inputs_converted[k]
-                self.context.set_tensor_address(k, x_input[(x_input.shape[0] // curr_split_batch) * i:].data_ptr())
+                x = model_inputs_converted[k]
+                self.context.set_tensor_address(k, x[(x.shape[0] // curr_split_batch) * i:].data_ptr())
             self.context.execute_async_v3(stream_handle=stream.cuda_stream)
         # stream.synchronize() #don't need to sync stream since it's the default torch one
-        
-        # ============================================================================
-        # CRITICAL FIX FOR VERTICAL LINE ARTIFACTS
-        # ============================================================================
-        # TensorRT may output tensors with non-standard memory layouts (strides)
-        # that cause Lumina2's unpatchify .view() operation to produce artifacts.
-        # 
-        # Root cause: .view() requires contiguous memory with standard strides
-        # Solution: Force proper memory layout using .clone() which guarantees
-        #           fresh allocation with standard C-contiguous layout
-        # ============================================================================
-        
-        # DEBUG: Log TensorRT raw output properties
-        print(f"\n{'='*60}")
-        print(f"[TensorRT VAE Debug] RAW OUTPUT from TensorRT:")
-        print(f"  Shape: {out.shape}")
-        print(f"  Dtype: {out.dtype}")
-        print(f"  Device: {out.device}")
-        print(f"  Is contiguous: {out.is_contiguous()}")
-        print(f"  Stride: {out.stride()}")
-        print(f"  Min value: {out.min().item():.6f}")
-        print(f"  Max value: {out.max().item():.6f}")
-        print(f"  Mean value: {out.mean().item():.6f}")
-        print(f"  Std value: {out.std().item():.6f}")
-        print(f"  Has NaN: {torch.isnan(out).any().item()}")
-        print(f"  Has Inf: {torch.isinf(out).any().item()}")
-        
-        # CRITICAL FIX: Force proper memory layout with .clone()
-        # This creates a new tensor with guaranteed standard C-contiguous layout
-        # .contiguous() alone may not change stride if tensor appears contiguous
-        # but has non-standard stride pattern from TensorRT
-        original_dtype = out.dtype
-        out_fixed = out.to(dtype=torch.float32).clone()
-        
-        # Verify the fix worked
-        expected_stride = (
-            out_fixed.shape[1] * out_fixed.shape[2] * out_fixed.shape[3],  # Batch stride
-            out_fixed.shape[2] * out_fixed.shape[3],                        # Channel stride
-            out_fixed.shape[3],                                              # Height stride
-            1                                                                # Width stride
-        )
-        
-        print(f"\n[TensorRT VAE Debug] FIXED OUTPUT (after clone + fp32):")
-        print(f"  Shape: {out_fixed.shape}")
-        print(f"  Dtype: {out_fixed.dtype}")
-        print(f"  Device: {out_fixed.device}")
-        print(f"  Is contiguous: {out_fixed.is_contiguous()}")
-        print(f"  Stride: {out_fixed.stride()}")
-        print(f"  Expected stride: {expected_stride}")
-        print(f"  Stride OK: {out_fixed.stride() == expected_stride}")
-        print(f"  Memory format: {out_fixed.stride()}")
-        print(f"{'='*60}\n")
-        
-        # Advanced VAE debugging if available
-        if VAE_DEBUG_AVAILABLE:
-            debug_hook = get_vae_debug_hook()
-            if debug_hook is not None:
-                debug_hook.analyze_latent(out_fixed, source="TensorRT")
-        
-        return out_fixed
+        return out
 
     def load_state_dict(self, sd, strict=False):
         pass
@@ -316,12 +172,10 @@ class TensorRTLoader:
             model = conf.get_model({})
             unet.dtype = torch.bfloat16 #TODO: autodetect
         elif model_type == "lumina2":
-            # FIXED: Proper Lumina2 configuration
-            from comfy.supported_models import Lumina2 as Lumina2Config
-            conf = Lumina2Config({})
+            conf = comfy.supported_models.Lumina2({})
             conf.unet_config["disable_unet_model_creation"] = True
             model = conf.get_model({})
-            unet.dtype = torch.bfloat16  # Match Lumina2 default
+            unet.dtype = torch.bfloat16 #TODO: autodetect
         model.diffusion_model = unet
         model.memory_required = lambda *args, **kwargs: 0 #always pass inputs batched up as much as possible, our TRT code will handle batch splitting
 

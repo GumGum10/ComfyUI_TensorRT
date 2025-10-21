@@ -2,203 +2,14 @@ import torch
 import sys
 import os
 import time
-import logging
-
-def setup_tensorrt_logging(log_file="tensorrt_build.log"):
-    """Setup comprehensive logging to file"""
-    
-    # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - [%(levelname)s] - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    # File handler (everything)
-    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    
-    # Console handler (INFO and above)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    
-    # Root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
-    
-    # Also capture print statements
-    class TeeOutput:
-        def __init__(self, file_path):
-            self.terminal = sys.stdout
-            self.log = open(file_path, 'a', encoding='utf-8')
-        
-        def write(self, message):
-            self.terminal.write(message)
-            self.log.write(message)
-            self.log.flush()
-        
-        def flush(self):
-            self.terminal.flush()
-            self.log.flush()
-    
-    # Redirect stdout to also write to file
-    sys.stdout = TeeOutput(log_file)
-    
-    return log_file
-
-
-import threading
-import subprocess
-import shutil
-
-# CRITICAL: Set TensorRT logger BEFORE importing tensorrt!
-import ctypes
-import sys
-
-class PreInitTRTLogger:
-    """Set logger before TensorRT loads"""
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    def __init__(self):
-        self.messages = []
-        
-    def log(self, severity, msg):
-        timestamp = time.strftime('%H:%M:%S')
-        self.messages.append((timestamp, severity, msg))
-        # Print immediately
-        if "tactic" in msg.lower() or "kernel" in msg.lower():
-            print(f"[{timestamp}] 🔍 {msg}")
-        elif "error" in msg.lower():
-            print(f"[{timestamp}] ❌ {msg}")
-        elif "warning" in msg.lower():
-            print(f"[{timestamp}] ⚠️  {msg}")
-
-# Pre-initialize logger
-_pre_logger = PreInitTRTLogger()
-
-# NOW import TensorRT
-import tensorrt as trt
-
-# Override the logger immediately
-try:
-    # This must happen before any Builder/Runtime creation
-    original_logger = trt.Logger(trt.Logger.VERBOSE)
-except Exception as e:
-    print(f"Failed to override logger: {e}")
-
 import comfy.model_management
+
+import tensorrt as trt
 import folder_paths
 from tqdm import tqdm
 
-try:
-    from .tensorrt_verbose_logging import create_verbose_logger
-    VERBOSE_LOGGING_AVAILABLE = True
-except ImportError:
-    VERBOSE_LOGGING_AVAILABLE = False
-    logging.warning("[TensorRT] Verbose logging not available")
-
-try:
-    from .lumina2_onnx_patch import patch_lumina2_for_onnx_export
-    LUMINA2_PATCH_AVAILABLE = True
-except ImportError:
-    LUMINA2_PATCH_AVAILABLE = False
-    logging.warning("[TensorRT] Lumina2 ONNX patch not available")
-
-
-class GPUProbe:
-    """Lightweight GPU telemetry using NVML if available, else nvidia-smi fallback.
-    Exposes a stats_str() with utilization, memory, temp, and power.
-    """
-
-    def __init__(self, device_index: int | None = None):
-        self.idx = int(device_index) if device_index is not None else (torch.cuda.current_device() if torch.cuda.is_available() else 0)
-        self._nvml = None
-        self._nvml_device = None
-        # Try NVML first
-        try:
-            import pynvml  # type: ignore
-
-            pynvml.nvmlInit()
-            self._nvml = pynvml
-            self._nvml_device = pynvml.nvmlDeviceGetHandleByIndex(self.idx)
-        except Exception:
-            # Fallback to nvidia-smi via subprocess
-            self._nvml = None
-            self._nvml_device = None
-
-    def _stats_via_nvml(self) -> str | None:
-        try:
-            if self._nvml is None or self._nvml_device is None:
-                return None
-            nvml = self._nvml
-            h = self._nvml_device
-            util = nvml.nvmlDeviceGetUtilizationRates(h)
-            mem = nvml.nvmlDeviceGetMemoryInfo(h)
-            temp = nvml.nvmlDeviceGetTemperature(h, nvml.NVML_TEMPERATURE_GPU)
-            try:
-                power = nvml.nvmlDeviceGetPowerUsage(h) / 1000.0  # W
-            except Exception:
-                power = None
-            used_gb = mem.used / (1024**3)
-            total_gb = mem.total / (1024**3)
-            pwr = f" {power:.0f}W" if power is not None else ""
-            return f"GPU{self.idx} {util.gpu}% {used_gb:.1f}/{total_gb:.1f} GB {temp}C{pwr}"
-        except Exception:
-            return None
-
-    def _stats_via_nvsmi(self) -> str | None:
-        try:
-            if shutil.which("nvidia-smi") is None:
-                return None
-            # Query a single GPU index
-            q = "utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
-            cmd = [
-                "nvidia-smi",
-                f"--id={self.idx}",
-                f"--query-gpu={q}",
-                "--format=csv,noheader,nounits",
-            ]
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=1.0)
-            # Example: "25, 1550, 24564, 45, 120.50"
-            parts = [p.strip() for p in out.strip().split(",")]
-            if len(parts) >= 5:
-                util = float(parts[0])
-                used_mb = float(parts[1])
-                total_mb = float(parts[2])
-                temp = float(parts[3])
-                power = float(parts[4])
-                used_gb = used_mb / 1024.0
-                total_gb = total_mb / 1024.0
-                return f"GPU{self.idx} {util:.0f}% {used_gb:.1f}/{total_gb:.1f} GB {temp:.0f}C {power:.0f}W"
-            return None
-        except Exception:
-            return None
-
-    def stats_str(self) -> str:
-        # Prefer NVML; fallback to nvidia-smi; else minimal torch memory
-        s = self._stats_via_nvml()
-        if s:
-            return s
-        s = self._stats_via_nvsmi()
-        if s:
-            return s
-        try:
-            if torch.cuda.is_available():
-                free, total = torch.cuda.mem_get_info()
-                used = total - free
-                return f"GPU{self.idx} {used/1e9:.1f}/{total/1e9:.1f} GB"
-        except Exception:
-            pass
-        return "GPU N/A"
-
+# TODO:
+# Make it more generic: less model specific code
 
 # add output directory to tensorrt search path
 if "tensorrt" in folder_paths.folder_names_and_paths:
@@ -213,31 +24,11 @@ else:
     )
 
 class TQDMProgressMonitor(trt.IProgressMonitor):
-    def __init__(self, gpu_probe: GPUProbe | None = None):
+    def __init__(self):
         trt.IProgressMonitor.__init__(self)
         self._active_phases = {}
         self._step_result = True
         self.max_indent = 5
-        self._last_log_time = {}
-        self._phase_meta = {}  # phase_name -> {total, start_time}
-        self._log_interval = 2.0  # seconds
-        self._gpu_probe = gpu_probe
-
-    def _gpu_mem_str(self):
-        try:
-            if self._gpu_probe is not None:
-                return self._gpu_probe.stats_str()
-        except Exception:
-            pass
-        # Fallback minimal
-        try:
-            if torch.cuda.is_available():
-                free, total = torch.cuda.mem_get_info()
-                used = total - free
-                return f"GPU {used/1e9:.1f}/{total/1e9:.1f} GB"
-        except Exception:
-            pass
-        return "GPU N/A"
 
     def phase_start(self, phase_name, parent_phase, num_steps):
         leave = False
@@ -261,9 +52,6 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
                 "nbIndents": nbIndents,
                 "parent_phase": parent_phase,
             }
-            self._phase_meta[phase_name] = {"total": int(num_steps), "start_time": time.time()}
-            self._last_log_time[phase_name] = 0.0
-            logging.info(f"[TRT][phase_start] {phase_name}: total_steps={num_steps}")
         except KeyboardInterrupt:
             # The phase_start callback cannot directly cancel the build, so request the cancellation from within step_complete.
             _step_result = False
@@ -290,9 +78,6 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
                         self._active_phases[phase_name]["parent_phase"]
                     ]["tq"].refresh()
                 del self._active_phases[phase_name]
-                meta = self._phase_meta.pop(phase_name, {"start_time": time.time(), "total": 0})
-                elapsed = time.time() - meta.get("start_time", time.time())
-                logging.info(f"[TRT][phase_finish] {phase_name}: elapsed={elapsed:.1f}s")
             pass
         except KeyboardInterrupt:
             _step_result = False
@@ -303,21 +88,6 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
                 self._active_phases[phase_name]["tq"].update(
                     step - self._active_phases[phase_name]["tq"].n
                 )
-                # Throttled progress log
-                now = time.time()
-                last = self._last_log_time.get(phase_name, 0.0)
-                total = max(1, self._phase_meta.get(phase_name, {}).get("total", 1))
-                if (now - last) >= self._log_interval or step >= (total - 1):
-                    self._last_log_time[phase_name] = now
-                    start_time = self._phase_meta.get(phase_name, {}).get("start_time", now)
-                    elapsed = now - start_time
-                    percent = 100.0 * min(max(step, 0), total) / total
-                    speed = step / elapsed if elapsed > 0 else 0.0
-                    remaining = (total - step) / speed if speed > 0 else float("inf")
-                    logging.info(
-                        f"[TRT][progress] {phase_name}: {step}/{total} ({percent:.1f}%) "
-                        f"elapsed={elapsed:.1f}s eta={(remaining if remaining!=float('inf') else 0):.1f}s {self._gpu_mem_str()}"
-                    )
             return self._step_result
         except KeyboardInterrupt:
             # There is no need to propagate this exception to TensorRT. We can simply cancel the build.
@@ -328,12 +98,9 @@ class TRT_MODEL_CONVERSION_BASE:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.temp_dir = folder_paths.get_temp_directory()
-        # Default timing cache path; will be customized per model prefix at runtime
-        self._timing_cache_dir = os.path.dirname(os.path.realpath(__file__))
-        self._default_timing_cache_path = os.path.normpath(
-            os.path.join(self._timing_cache_dir, "timing_cache.trt")
+        self.timing_cache_path = os.path.normpath(
+            os.path.join(os.path.join(os.path.dirname(os.path.realpath(__file__)), "timing_cache.trt"))
         )
-        self._current_timing_cache_path = self._default_timing_cache_path
 
     RETURN_TYPES = ()
     FUNCTION = "convert"
@@ -344,31 +111,13 @@ class TRT_MODEL_CONVERSION_BASE:
     def INPUT_TYPES(s):
         raise NotImplementedError
 
-    def _update_timing_cache_path(self, filename_prefix: str):
-        """Create a per-prefix timing cache to speed up repeated builds for the same model/config."""
-        try:
-            slug = (
-                filename_prefix.replace("\\", "_")
-                .replace("/", "_")
-                .replace(":", "_")
-                .replace(" ", "_")
-            )
-            # Keep the filename short but unique enough
-            slug = slug[-120:]
-            self._current_timing_cache_path = os.path.normpath(
-                os.path.join(self._timing_cache_dir, f"timing_cache_{slug}.trt")
-            )
-        except Exception:
-            self._current_timing_cache_path = self._default_timing_cache_path
-
     # Sets up the builder to use the timing cache file, and creates it if it does not already exist
     def _setup_timing_cache(self, config: trt.IBuilderConfig):
         buffer = b""
-        path = self._current_timing_cache_path
-        if os.path.exists(path):
-            with open(path, mode="rb") as timing_cache_file:
+        if os.path.exists(self.timing_cache_path):
+            with open(self.timing_cache_path, mode="rb") as timing_cache_file:
                 buffer = timing_cache_file.read()
-            print("Read {} bytes from timing cache ({}).".format(len(buffer), os.path.basename(path)))
+            print("Read {} bytes from timing cache.".format(len(buffer)))
         else:
             print("No timing cache found; Initializing a new one.")
         timing_cache: trt.ITimingCache = config.create_timing_cache(buffer)
@@ -377,50 +126,8 @@ class TRT_MODEL_CONVERSION_BASE:
     # Saves the config's timing cache to file
     def _save_timing_cache(self, config: trt.IBuilderConfig):
         timing_cache: trt.ITimingCache = config.get_timing_cache()
-        path = self._current_timing_cache_path
-        with open(path, "wb") as timing_cache_file:
+        with open(self.timing_cache_path, "wb") as timing_cache_file:
             timing_cache_file.write(memoryview(timing_cache.serialize()))
-
-    def _start_progress_heartbeat(self, monitor: "TQDMProgressMonitor", interval_s: float = 5.0):
-        """Start a background thread that logs a heartbeat for the current active phase.
-
-        Returns a tuple (stop_event, thread). Caller must set stop_event and join thread when done.
-        """
-        stop_event = threading.Event()
-
-        def _heartbeat():
-            while not stop_event.wait(interval_s):
-                try:
-                    # Find the deepest active phase (max indent)
-                    if not monitor._active_phases:
-                        continue
-                    # Choose the phase with highest nbIndents (deepest) or the last started
-                    phase = None
-                    max_indent = -1
-                    for name, data in list(monitor._active_phases.items()):
-                        indent = data.get("nbIndents", 0)
-                        if indent >= max_indent:
-                            max_indent = indent
-                            phase = name
-                    if phase is None:
-                        continue
-                    tq = monitor._active_phases[phase]["tq"]
-                    total = max(1, int(tq.total))
-                    step = int(tq.n)
-                    percent = 100.0 * min(step, total) / total
-                    meta = monitor._phase_meta.get(phase, {})
-                    start_time = meta.get("start_time", time.time())
-                    elapsed = time.time() - start_time
-                    logging.info(
-                        f"[TRT][heartbeat] {phase}: {step}/{total} ({percent:.1f}%) elapsed={elapsed:.1f}s {monitor._gpu_mem_str()}"
-                    )
-                except Exception:
-                    # Best-effort; ignore heartbeat errors
-                    pass
-
-        th = threading.Thread(target=_heartbeat, name="TRTProgressHeartbeat", daemon=True)
-        th.start()
-        return stop_event, th
 
     def _convert(
         self,
@@ -440,23 +147,7 @@ class TRT_MODEL_CONVERSION_BASE:
         context_max,
         num_video_frames,
         is_static: bool,
-        fast_build: bool = False,
     ):
-        tensorrt_log_dir = os.path.join(self.output_dir, "tensorrt", "logs")
-        os.makedirs(tensorrt_log_dir, exist_ok=True)
-        
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        log_filename = f"tensorrt_build_{timestamp}.log"
-        log_file = os.path.join(tensorrt_log_dir, log_filename)
-        
-        setup_tensorrt_logging(log_file)
-        logging.info(f"[TensorRT] ========================================")
-        logging.info(f"[TensorRT] Log file: {log_file}")
-        logging.info(f"[TensorRT] ========================================")
-        print(f"\n📝 TensorRT build log: {log_file}\n")
-
-        # Update per-prefix timing cache path early
-        self._update_timing_cache_path(filename_prefix)
         output_onnx = os.path.normpath(
             os.path.join(
                 os.path.join(self.temp_dir, "{}".format(time.time())), "model.onnx"
@@ -467,22 +158,12 @@ class TRT_MODEL_CONVERSION_BASE:
         comfy.model_management.load_models_gpu([model], force_patch_weights=True, force_full_load=True)
         unet = model.model.diffusion_model
 
-        is_lumina2 = isinstance(model.model, comfy.model_base.Lumina2)
         context_dim = model.model.model_config.unet_config.get("context_dim", None)
         context_len = 77
         context_len_min = context_len
         y_dim = model.model.adm_channels
         extra_input = {}
         dtype = torch.float16
-        # In tensorrt_convert.py, around line 360, ADD THIS:
-        logging.info(f"[TensorRT] ===== MODEL DETECTION =====")
-        logging.info(f"[TensorRT] Model type: {type(model.model)}")
-        logging.info(f"[TensorRT] Model base: {type(model.model).__bases__}")
-        logging.info(f"[TensorRT] Is SD3: {isinstance(model.model, comfy.model_base.SD3)}")
-        logging.info(f"[TensorRT] Is Flux: {isinstance(model.model, comfy.model_base.Flux)}")
-        logging.info(f"[TensorRT] Is Lumina2: {isinstance(model.model, comfy.model_base.Lumina2)}")
-        logging.info(f"[TensorRT] Model config: {model.model.model_config.__class__.__name__}")
-        logging.info(f"[TensorRT] =============================")
 
         if isinstance(model.model, comfy.model_base.SD3): #SD3
             context_embedder_config = model.model.model_config.unet_config.get("context_embedder_config", None)
@@ -500,41 +181,17 @@ class TRT_MODEL_CONVERSION_BASE:
             y_dim = model.model.model_config.unet_config.get("vec_in_dim", None)
             extra_input = {"guidance": ()}
             dtype = torch.bfloat16
-        elif is_lumina2:
-            logging.info("[TensorRT] Detected Lumina2 model, configuring NextDiT architecture")
-            
-            # Apply ONNX compatibility patch
-            if LUMINA2_PATCH_AVAILABLE:
-                patch_lumina2_for_onnx_export()
-            else:
-                raise RuntimeError("Lumina2 ONNX patch is required but not available. Please ensure lumina2_onnx_patch.py is in the same directory.")
-            
-            # Use actual Gemma2-2B embedding dimension
-            context_dim = 2304
-            # Use dynamic sequence length. We'll still keep the multiplier semantics below,
-            # but auto-bump the ranges if the user left the defaults at 1 to avoid broken engines.
-            context_len_min = 1
-            context_len = 1
-            
-            y_dim = 0
-            dtype = torch.bfloat16
-
-           
-            # CRITICAL FIX: Don't add num_tokens as a dynamic input
-            # Instead, we'll wrap the model to use context.shape[1] as num_tokens
-            extra_input = {}  # Changed from {"num_tokens": ()}
-            logging.info(f"[TensorRT] Lumina2 Configuration:")
-            logging.info(f"[TensorRT] - Context Dimension: {context_dim}")
-            logging.info(f"[TensorRT] - Context will be: context_len * context_opt tokens")
-            logging.info(f"[TensorRT] - Recommended: context_min=3, context_opt=137, context_max=512")
-
-            
-            logging.info(f"[TensorRT] Lumina2 Configuration:")
-            logging.info(f"[TensorRT] - Context Dimension: {context_dim}")
-            logging.info(f"[TensorRT] - Context Length Min/Opt: {context_len_min}/{context_len}")
-            logging.info(f"[TensorRT] - Data Type: {dtype}")
-            
-            print(f"✅ Lumina2 NextDiT ready for ONNX export (context_dim={context_dim})")
+        elif isinstance(model.model, comfy.model_base.Lumina2):
+            context_dim = model.model.model_config.unet_config.get("cap_feat_dim", None)
+            context_len_min = 256
+            context_len = 256
+            y_dim = 0  # Lumina2 doesn't use y embeddings
+            # For Lumina2, num_tokens and attention_mask will be baked into the model
+            # as constants during ONNX export (one engine per configuration)
+            extra_input = {}  # Don't add as dynamic inputs
+            # Force model to bfloat16
+            model.model.diffusion_model.to(torch.bfloat16)
+            dtype = torch.bfloat16            
 
         if context_dim is not None:
             input_names = ["x", "timesteps", "context"]
@@ -543,230 +200,10 @@ class TRT_MODEL_CONVERSION_BASE:
             dynamic_axes = {
                 "x": {0: "batch", 2: "height", 3: "width"},
                 "timesteps": {0: "batch"},
-                "context": {0: "batch", 1: "seq_len"},  # FIXED: Use seq_len for Lumina2
+                "context": {0: "batch", 1: "num_embeds"},
             }
 
             transformer_options = model.model_options['transformer_options'].copy()
-
-            # Auto-bump context profile ranges for Lumina2 if left at defaults.
-            # Engines built with context_{min,opt,max}=1 will force seq_len==1 and the loader
-            # will truncate captions to a single token, causing severe artifacts.
-            if is_lumina2:
-                orig_ctx = (context_min, context_opt, context_max)
-                rec_min, rec_opt, rec_max = 3, 137, 512
-                # Only bump when clearly unset (<=1). Preserve explicit user choices >1.
-                context_min = max(rec_min, context_min) if context_min <= 1 else context_min
-                context_opt = max(rec_opt, context_opt) if context_opt <= 1 else context_opt
-                context_max = max(rec_max, context_max) if context_max <= 1 else context_max
-                # Ensure ordering min <= opt <= max
-                context_opt = max(context_min, context_opt)
-                context_max = max(context_opt, context_max)
-                if orig_ctx != (context_min, context_opt, context_max):
-                    logging.warning(
-                        f"[TensorRT][Lumina2] Auto-adjusted context profile from {orig_ctx} to "
-                        f"(min,opt,max)=({context_min},{context_opt},{context_max}). "
-                        "To override, set values explicitly in the node."
-                    )
-            
-            # LUMINA2: CRITICAL FIX - Patch BOTH patchify and unpatchify BEFORE ONNX export
-            if is_lumina2:
-                logging.info("[TensorRT] Patching Lumina2 patchify_and_embed for TensorRT-safe compilation...")
-                
-                # Store original methods
-                import types
-                _original_patchify_and_embed = unet.patchify_and_embed
-                _original_unpatchify = unet.unpatchify
-                
-                def safe_patchify_and_embed(self, x, cap_feats, cap_mask, t, num_tokens):
-                    """
-                    TensorRT-safe patchify using .reshape() instead of .view()
-                    This is a partial override - we only fix the critical .view() operation
-                    """
-                    # Call most of the original logic by duplicating it with the fix
-                    bsz = len(x)
-                    pH = pW = self.patch_size
-                    device = x[0].device
-                    dtype = x[0].dtype
-
-                    if cap_mask is not None:
-                        l_effective_cap_len = cap_mask.sum(dim=1).tolist()
-                    else:
-                        l_effective_cap_len = [num_tokens] * bsz
-
-                    if cap_mask is not None and not torch.is_floating_point(cap_mask):
-                        cap_mask = (cap_mask - 1).to(dtype) * torch.finfo(dtype).max
-
-                    img_sizes = [(img.size(1), img.size(2)) for img in x]
-                    l_effective_img_len = [(H // pH) * (W // pW) for (H, W) in img_sizes]
-
-                    max_seq_len = max(
-                        (cap_len+img_len for cap_len, img_len in zip(l_effective_cap_len, l_effective_img_len))
-                    )
-                    max_cap_len = max(l_effective_cap_len)
-                    max_img_len = max(l_effective_img_len)
-
-                    position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
-
-                    for i in range(bsz):
-                        cap_len = l_effective_cap_len[i]
-                        img_len = l_effective_img_len[i]
-                        H, W = img_sizes[i]
-                        H_tokens, W_tokens = H // pH, W // pW  # CRITICAL FIX: W_tokens must use pW not pH!
-                        assert H_tokens * W_tokens == img_len
-
-                        position_ids[i, :cap_len, 0] = torch.arange(cap_len, dtype=torch.int32, device=device)
-                        position_ids[i, cap_len:cap_len+img_len, 0] = cap_len
-                        row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
-                        col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
-                        position_ids[i, cap_len:cap_len+img_len, 1] = row_ids
-                        position_ids[i, cap_len:cap_len+img_len, 2] = col_ids
-
-                    freqs_cis = self.rope_embedder(position_ids).movedim(1, 2).to(dtype)
-
-                    cap_freqs_cis_shape = list(freqs_cis.shape)
-                    cap_freqs_cis_shape[1] = cap_feats.shape[1]
-                    cap_freqs_cis = torch.zeros(*cap_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
-
-                    img_freqs_cis_shape = list(freqs_cis.shape)
-                    img_freqs_cis_shape[1] = max_img_len
-                    img_freqs_cis = torch.zeros(*img_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
-
-                    for i in range(bsz):
-                        cap_len = l_effective_cap_len[i]
-                        img_len = l_effective_img_len[i]
-                        cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
-                        img_freqs_cis[i, :img_len] = freqs_cis[i, cap_len:cap_len+img_len]
-
-                    for layer in self.context_refiner:
-                        cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
-
-                    # CRITICAL FIX: Use einsum instead of permute (like SD3/Flux)
-                    flat_x = []
-                    for i in range(bsz):
-                        img = x[i]
-                        C, H, W = img.size()
-                        # ORIGINAL: img.view(C, H // pH, pH, W // pW, pW).permute(1, 3, 2, 4, 0).flatten(2).flatten(0, 1)
-                        # FIXED: Use einsum for TensorRT-safe compilation
-                        # Reshape to 5D: [C, H_patches, pH, W_patches, pW]
-                        img_5d = img.reshape(C, H // pH, pH, W // pW, pW)
-                        # Dimension mapping: [C, h, p_h, w, p_w] -> permute(1,3,2,4,0) -> [h, w, p_h, p_w, C]
-                        # In einsum: chpwq (where q=p_w) -> hwpqc
-                        img_reordered = torch.einsum('chpwq->hwpqc', img_5d)
-                        # Flatten: [h,w,p_h,p_w,C] -> flatten(2) -> [h,w,p_h*p_w*C] -> flatten(0,1) -> [h*w, p_h*p_w*C]
-                        img = img_reordered.flatten(2).flatten(0, 1)
-                        flat_x.append(img)
-                    x = flat_x
-                    
-                    padded_img_embed = torch.zeros(bsz, max_img_len, x[0].shape[-1], device=device, dtype=x[0].dtype)
-                    padded_img_mask = torch.zeros(bsz, max_img_len, dtype=dtype, device=device)
-                    for i in range(bsz):
-                        padded_img_embed[i, :l_effective_img_len[i]] = x[i]
-                        padded_img_mask[i, l_effective_img_len[i]:] = -torch.finfo(dtype).max
-
-                    padded_img_embed = self.x_embedder(padded_img_embed)
-                    padded_img_mask = padded_img_mask.unsqueeze(1)
-                    for layer in self.noise_refiner:
-                        padded_img_embed = layer(padded_img_embed, padded_img_mask, img_freqs_cis, t)
-
-                    if cap_mask is not None:
-                        mask = torch.zeros(bsz, max_seq_len, dtype=dtype, device=device)
-                        mask[:, :max_cap_len] = cap_mask[:, :max_cap_len]
-                    else:
-                        mask = None
-
-                    padded_full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x[0].dtype)
-                    for i in range(bsz):
-                        cap_len = l_effective_cap_len[i]
-                        img_len = l_effective_img_len[i]
-                        padded_full_embed[i, :cap_len] = cap_feats[i, :cap_len]
-                        padded_full_embed[i, cap_len:cap_len+img_len] = padded_img_embed[i, :img_len]
-                        if mask is not None:
-                            mask[i, cap_len+img_len:] = -torch.finfo(dtype).max
-
-                    return padded_full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
-                
-                def safe_unpatchify(self, x, img_size, cap_size, return_tensor=False):
-                    """
-                    TensorRT-safe unpatchify using einsum (like SD3/Flux) instead of permute
-                    This prevents vertical line artifacts from TensorRT's permute optimization issues
-                    """
-                    pH = pW = self.patch_size
-                    imgs = []
-                    for i in range(x.size(0)):
-                        H, W = img_size[i]
-                        begin = cap_size[i]
-                        end = begin + (H // pH) * (W // pW)
-                        
-                        patches = x[i][begin:end]
-                        
-                        # CRITICAL: Use einsum like SD3/Flux instead of permute
-                        # TensorRT handles einsum better than permute for complex reshapes
-                        # Original:  .view().permute(4,0,2,1,3).flatten(3,4).flatten(1,2)
-                        # New:       .reshape().einsum().flatten()
-                        
-                        # Reshape to 5D: [H_patches, W_patches, pH, pW, C]
-                        patches_5d = patches.reshape(H // pH, W // pW, pH, pW, self.out_channels)
-                        
-                        # Original permute(4,0,2,1,3) means: [C, H_patches, pH, W_patches, pW]
-                        # With einsum notation without batch: hwpqc -> chpwq
-                        # But wait - permute(4,0,2,1,3) on [h,w,p,q,c] gives [c,h,p,w,q]!
-                        # Let me map: dim0=h, dim1=w, dim2=p, dim3=q, dim4=c
-                        # permute(4,0,2,1,3) = [dim4, dim0, dim2, dim1, dim3] = [c, h, p, w, q]
-                        patches_reordered = torch.einsum('hwpqc->chpwq', patches_5d)
-                        
-                        # Now flatten: [c,h,p,w,q] -> flatten(3,4) -> [c,h,p,w*q] -> flatten(1,2) -> [c,h*p,w*q]
-                        # But we want [c, H, W] where H=h*p, W=w*q
-                        # So: [c,h,p,w,q] -> [c, h*p, w*q]
-                        img = patches_reordered.flatten(3, 4).flatten(1, 2)
-                        imgs.append(img)
-                    
-                    if return_tensor:
-                        imgs = torch.stack(imgs, dim=0)
-                    return imgs
-                
-                # Apply the patches
-                unet.patchify_and_embed = types.MethodType(safe_patchify_and_embed, unet)
-                unet.unpatchify = types.MethodType(safe_unpatchify, unet)
-                logging.info("[TensorRT] ✅ Patched BOTH patchify AND unpatchify using EINSUM (like SD3/Flux) for TensorRT compatibility")
-                
-            # LUMINA2: Wrap model now that we have transformer_options
-            if is_lumina2:
-                class Lumina2ONNXWrapper(torch.nn.Module):
-                    """
-                    ONNX-compatible wrapper for Lumina2 with DYNAMIC shape support
-                    Uses einsum-based patchify/unpatchify (like SD3/Flux) for TensorRT compatibility
-                    """
-                    def __init__(self, unet, transformer_options):
-                        super().__init__()
-                        self.unet = unet
-                        self.transformer_options = transformer_options
-                        
-                    def forward(self, x, timesteps, context):
-                        """
-                        Args:
-                            x: [B, C, H, W] latent tensor
-                            timesteps: [B] timestep tensor  
-                            context: [B, L, D] text embeddings - L is DYNAMIC!
-                        """
-                        # CRITICAL: Use context.shape[1] - this preserves dynamic dimension
-                        num_tokens = context.shape[1]
-                        
-                        # Call original model (which now has patched patchify AND unpatchify)
-                        return self.unet(
-                            x,
-                            timesteps,
-                            context,
-                            num_tokens=num_tokens,
-                            attention_mask=None,
-                            transformer_options=self.transformer_options
-                        )
-                
-                # Wrap the model
-                unet = Lumina2ONNXWrapper(unet, transformer_options)
-                logging.info("[TensorRT] Wrapped Lumina2 model with DYNAMIC SHAPE ONNX wrapper")
-                logging.info("[TensorRT]    Using EINSUM-based patchify/unpatchify (SD3/Flux approach) for TensorRT")
-
-            
             if model.model.model_config.unet_config.get(
                 "use_temporal_resblock", False
             ):  # SVD
@@ -791,14 +228,36 @@ class TRT_MODEL_CONVERSION_BASE:
                 svd_unet.transformer_options = transformer_options
                 unet = svd_unet
                 context_len_min = context_len = 1
-            elif not is_lumina2:  # Don't wrap again if already wrapped for Lumina2
-                class UNET(torch.nn.Module):
-                    def forward(self, x, timesteps, context, *args):
-                        extras = input_names[3:]
-                        extra_args = {}
-                        for i in range(len(extras)):
-                            extra_args[extras[i]] = args[i]
-                        return self.unet(x, timesteps, context, transformer_options=self.transformer_options, **extra_args)
+            else:
+                # Check if this is Lumina2 which has a different signature
+                is_lumina2 = isinstance(model.model, comfy.model_base.Lumina2)
+                
+                if is_lumina2:
+                    class UNET(torch.nn.Module):
+                        def forward(self, x, timesteps, context):
+                            # For Lumina2 ONNX export, we bake in num_tokens and attention_mask
+                            # as constants. This means you need one engine per text length configuration.
+                            # Using None for attention_mask means no masking (all tokens are valid)
+                            num_tokens = context.shape[1]  # Number of tokens from context shape
+                            attention_mask = None  # No masking - all tokens valid
+                            
+                            return self.unet(
+                                x, 
+                                timesteps, 
+                                context, 
+                                num_tokens, 
+                                attention_mask=attention_mask,
+                                transformer_options=self.transformer_options
+                            )
+                else:
+                    class UNET(torch.nn.Module):
+                        def forward(self, x, timesteps, context, *args):
+                            extras = input_names[3:]
+                            extra_args = {}
+                            for i in range(len(extras)):
+                                extra_args[extras[i]] = args[i]
+                            
+                            return self.unet(x, timesteps, context, transformer_options=self.transformer_options, **extra_args)
 
                 _unet = UNET()
                 _unet.unet = unet
@@ -839,17 +298,12 @@ class TRT_MODEL_CONVERSION_BASE:
 
 
             inputs = ()
-            for i, shape in enumerate(inputs_shapes_opt):
-                # Use float32 for timesteps for better ONNX/TRT compatibility
-                in_dtype = torch.float32 if (i == 1) else dtype
-                # FIXED: num_tokens should be int32
-                if i < len(input_names) and input_names[i] == "num_tokens":
-                    in_dtype = torch.int32
+            for shape in inputs_shapes_opt:
                 inputs += (
                     torch.zeros(
                         shape,
                         device=comfy.model_management.get_torch_device(),
-                        dtype=in_dtype,
+                        dtype=dtype,
                     ),
                 )
 
@@ -858,242 +312,49 @@ class TRT_MODEL_CONVERSION_BASE:
             return ()
 
         os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
-        
-        logging.info("[TensorRT] Preparing for ONNX export:")
-        logging.info(f"[TensorRT] - Output path: {output_onnx}")
-        logging.info(f"[TensorRT] - Input names: {input_names}")
-        logging.info(f"[TensorRT] - Output names: {output_names}")
-        logging.info(f"[TensorRT] - Dynamic axes: {dynamic_axes}")
-        
-        # Log input tensor information
-        logging.info("[TensorRT] Input tensor details:")
-        for idx, (name, tensor) in enumerate(zip(input_names, inputs)):
-            logging.info(f"[TensorRT] - {name}:")
-            logging.info(f"    Shape: {tensor.shape}")
-            logging.info(f"    Dtype: {tensor.dtype}")
-            logging.info(f"    Device: {tensor.device}")
-            
-            # Check for NaN/Inf values
-            with torch.no_grad():
-                has_nan = tensor.isnan().any().item() if tensor.dtype.is_floating_point else False
-                has_inf = tensor.isinf().any().item() if tensor.dtype.is_floating_point else False
-                if has_nan or has_inf:
-                    logging.warning(f"[TensorRT] Found NaN/Inf in {name} tensor!")
-        
-        try:
-            logging.info("[TensorRT] Starting ONNX export...")
-            torch.onnx.export(
-                unet,
-                inputs,
-                output_onnx,
-                verbose=False,  # Set to True for debugging
-                input_names=input_names,
-                output_names=output_names,
-                opset_version=17,
-                dynamic_axes=dynamic_axes,
-            )
-            logging.info("[TensorRT] ONNX export completed successfully")
-            try:
-                file_size_mb = os.path.getsize(output_onnx) / (1024 * 1024)
-                logging.info(f"[TensorRT] ONNX file size: {file_size_mb:.1f} MB")
-            except Exception:
-                pass
-            
-            # Verify the exported model
-            import onnx
-            logging.info("[TensorRT] Verifying exported ONNX model...")
-            try:
-                # Prefer path-based check to handle large external data models
-                onnx.checker.check_model(output_onnx)
-                logging.info("[TensorRT] ONNX model verification passed (path-based)")
-
-                # Best-effort lightweight introspection without loading external data
-                try:
-                    onnx_model_light = onnx.load_model(output_onnx, load_external_data=False)  # type: ignore[call-arg]
-                    opset_version = onnx_model_light.opset_import[0].version if onnx_model_light.opset_import else 'unknown'
-                    logging.info(f"[TensorRT] Model opset version: {opset_version}")
-                    graph = onnx_model_light.graph
-                    logging.info(f"[TensorRT] Graph structure (light):")
-                    logging.info(f" - Nodes: {len(graph.node)}")
-                    logging.info(f" - Inputs: {[i.name for i in graph.input]}")
-                    logging.info(f" - Outputs: {[o.name for o in graph.output]}")
-                except Exception as e_light:
-                    logging.debug(f"[TensorRT] Skipping light introspection: {e_light}")
-
-            except Exception as e:
-                logging.error(f"[TensorRT] ONNX model verification failed: {str(e)}")
-                raise
-                
-        except Exception as e:
-            logging.error(f"[TensorRT] Error during ONNX export: {str(e)}")
-            raise
+        torch.onnx.export(
+            unet,
+            inputs,
+            output_onnx,
+            verbose=False,
+            input_names=input_names,
+            output_names=output_names,
+            opset_version=17,
+            dynamic_axes=dynamic_axes,
+        )
 
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
 
         # TRT conversion starts here
-        logging.info("[TensorRT] Starting TensorRT conversion phase")
-        if VERBOSE_LOGGING_AVAILABLE:
-            logger = create_verbose_logger()
-            logging.info("[TensorRT] Using detailed verbose logging")
-        else:
-            logger = trt.Logger(trt.Logger.VERBOSE)
-            
+        logger = trt.Logger(trt.Logger.INFO)
         builder = trt.Builder(logger)
-        logging.info(f"[TensorRT] Created TensorRT builder (version: {trt.__version__})")
 
         network = builder.create_network(
             1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
         )
-        logging.info("[TensorRT] Created network with explicit batch dimension")
-        
         parser = trt.OnnxParser(network, logger)
-        logging.info("[TensorRT] Created ONNX parser")
-        
-        logging.info(f"[TensorRT] Parsing ONNX file: {output_onnx}")
         success = parser.parse_from_file(output_onnx)
-        
-        # Log any parser errors
-        if parser.num_errors > 0:
-            logging.error("[TensorRT] Encountered parser errors:")
-            for idx in range(parser.num_errors):
-                error = parser.get_error(idx)
-                logging.error(f"[TensorRT] Parser error {idx + 1}: {error}")
-                print(f"Parser error {idx + 1}: {error}")
+        for idx in range(parser.num_errors):
+            print(parser.get_error(idx))
 
         if not success:
-            logging.error("[TensorRT] ONNX parsing failed!")
             print("ONNX load ERROR")
             return ()
-            
-        logging.info("[TensorRT] ONNX parsing completed successfully")
-        
-        # Log network information
-        logging.info("[TensorRT] Network information:")
-        logging.info(f"[TensorRT] - Number of inputs: {network.num_inputs}")
-        logging.info(f"[TensorRT] - Number of outputs: {network.num_outputs}")
-        logging.info(f"[TensorRT] - Number of layers: {network.num_layers}")
-        
-        # Log input tensor information
-        logging.info("[TensorRT] Network input details:")
-        for i in range(network.num_inputs):
-            tensor = network.get_input(i)
-            logging.info(f"[TensorRT] Input {i}:")
-            logging.info(f"  - Name: {tensor.name}")
-            logging.info(f"  - Shape: {tensor.shape}")
-            logging.info(f"  - Dtype: {tensor.dtype}")
-            
-        # Log output tensor information
-        logging.info("[TensorRT] Network output details:")
-        for i in range(network.num_outputs):
-            tensor = network.get_output(i)
-            logging.info(f"[TensorRT] Output {i}:")
-            logging.info(f"  - Name: {tensor.name}")
-            logging.info(f"  - Shape: {tensor.shape}")
-            logging.info(f"  - Dtype: {tensor.dtype}")
 
-        logging.info("[TensorRT] Creating builder configuration")
         config = builder.create_builder_config()
         profile = builder.create_optimization_profile()
-        
-        logging.info("[TensorRT] Setting up timing cache")
         self._setup_timing_cache(config)
-        # Attach GPU probe to progress monitor for richer telemetry
-        gpu_idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
-        config.progress_monitor = TQDMProgressMonitor(gpu_probe=GPUProbe(gpu_idx))
-        # Builder configuration: Optimal settings for your hardware
-        if fast_build:
-            # FAST BUILD MODE (for iteration/testing)
-            try:
-                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 20 << 30)  # 20GB (increased from 4GB)
-                logging.info("[TensorRT] [fast_build] Set WORKSPACE to 20 GiB")
-            except Exception as e:
-                logging.debug(f"[TensorRT] [fast_build] set_memory_pool_limit error: {e}")
-            
-            try:
-                if hasattr(config, 'builder_optimization_level'):
-                    config.builder_optimization_level = 0  # DEBUG DEBUG DEBUG 0 -> USES FIRST FOUND ALGO
-                    logging.info(f"✨✨✨[TensorRT] [fast_build] builder_optimization_level={config.builder_optimization_level}")
-            except Exception as e:
-                logging.debug(f"[TensorRT] [fast_build] builder_optimization_level error: {e}")
-            
-            try:
-                if hasattr(trt, 'TacticSource') and hasattr(config, 'set_tactic_sources'):
-                    sources = 0
-                    # Add more tactic sources for better quality
-                    for s in ('CUBLAS', 'CUBLAS_LT'):  # Added CUBLAS
-                        if hasattr(trt.TacticSource, s):
-                            sources |= getattr(trt.TacticSource, s)
-                    if sources:
-                        config.set_tactic_sources(sources)
-                        logging.info("[TensorRT] [fast_build] Enabled tactic sources: cuBLAS + cuBLASLt")
-            except Exception as e:
-                logging.debug(f"[TensorRT] [fast_build] set_tactic_sources error: {e}")
-
-        else:
-            # PRODUCTION BUILD MODE - OPTIMIZED FOR i7-13700K + 64GB RAM + RTX 4090
-            try:
-                # MAXIMIZE workspace - 24GB VRAM, 16GB for workspace!
-                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 16 << 30)  # 16GB (increased from 12GB)
-                logging.info("[TensorRT] Set WORKSPACE to 16 GiB (maximizing 4090's 24GB VRAM)")
-            except Exception as e:
-                logging.debug(f"[TensorRT] set_memory_pool_limit error: {e}")
-            
-            try:
-                # Use Level 3 (NVIDIA recommended) instead of 4 for better time/quality balance
-                if hasattr(config, 'builder_optimization_level'):
-                    config.builder_optimization_level = 3  # Changed from 4 to 3 (RECOMMENDED)
-                    logging.info("[TensorRT] Set builder_optimization_level=3 (NVIDIA recommended)")
-            except Exception as e:
-                logging.debug(f"[TensorRT] builder_optimization_level error: {e}")
-            
-            try:
-                # Enable ALL tactic sources for maximum GPU utilization
-                if hasattr(trt, 'TacticSource') and hasattr(config, 'set_tactic_sources'):
-                    sources = 0
-                    # Add ALL available tactic sources
-                    for s in ('CUBLAS', 'CUBLAS_LT', 'CUDNN', 'EDGE_MASK_CONVOLUTIONS', 'JIT_CONVOLUTIONS'):
-                        if hasattr(trt.TacticSource, s):
-                            sources |= getattr(trt.TacticSource, s)
-                    if sources:
-                        config.set_tactic_sources(sources)
-                        logging.info("[TensorRT] Enabled ALL tactic sources for maximum GPU utilization")
-            except Exception as e:
-                logging.debug(f"[TensorRT] set_tactic_sources error: {e}")
-            
-            # OPTIONAL: Increase timing iterations for more accurate profiling
-            try:
-                if hasattr(config, 'avg_timing_iterations'):
-                    config.avg_timing_iterations = 16  # Default is 8, increase for better accuracy
-                    logging.info("[TensorRT] Set avg_timing_iterations=16 (more accurate profiling)")
-            except Exception as e:
-                logging.debug(f"[TensorRT] avg_timing_iterations error: {e}")
-            
-            # OPTIONAL: Enable profiling verbosity to see what TRT is doing
-            try:
-                if hasattr(config, 'profiling_verbosity'):
-                    config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
-                    logging.info("[TensorRT] Enabled detailed profiling verbosity")
-            except Exception as e:
-                logging.debug(f"[TensorRT] profiling_verbosity error: {e}")
+        config.progress_monitor = TQDMProgressMonitor()
+        ## DEBUG -> TO REMOVE LATER
+        config.builder_optimization_level = 0
 
         prefix_encode = ""
         for k in range(len(input_names)):
             min_shape = inputs_shapes_min[k]
             opt_shape = inputs_shapes_opt[k]
             max_shape = inputs_shapes_max[k]
-            
-            logging.info(f"[TensorRT] Setting shape for {input_names[k]}:")
-            logging.info(f"  - Minimum shape: {min_shape}")
-            logging.info(f"  - Optimal shape: {opt_shape}")
-            logging.info(f"  - Maximum shape: {max_shape}")
-            
-            try:
-                profile.set_shape(input_names[k], min_shape, opt_shape, max_shape)
-                logging.info(f"[TensorRT] Successfully set shape profile for {input_names[k]}")
-            except Exception as e:
-                logging.error(f"[TensorRT] Error setting shape for {input_names[k]}: {str(e)}")
-                raise
+            profile.set_shape(input_names[k], min_shape, opt_shape, max_shape)
 
             # Encode shapes to filename
             encode = lambda a: ".".join(map(lambda x: str(x), a))
@@ -1104,11 +365,41 @@ class TRT_MODEL_CONVERSION_BASE:
         if dtype == torch.float16:
             config.set_flag(trt.BuilderFlag.FP16)
         if dtype == torch.bfloat16:
-            try:
-                config.set_flag(trt.BuilderFlag.BF16)
-            except Exception as e:
-                logging.warning(f"[TensorRT] BF16 not supported, falling back to FP16: {e}")
-                config.set_flag(trt.BuilderFlag.FP16)
+            config.set_flag(trt.BuilderFlag.BF16)
+
+        # Set precision constraints: keep input and output layers in high precision
+        # This prevents quantization artifacts at the boundaries
+        print("Setting precision constraints for input and output layers...")
+        
+        # Mark input layers to use high precision (no quantization)
+        for i in range(network.num_inputs):
+            input_tensor = network.get_input(i)
+            input_name = input_tensor.name
+            
+            # Skip timesteps
+            if 'timestep' in input_name.lower():
+                print(f"  Input '{input_name}': skipped (timesteps remain float32)")
+                continue
+            input_tensor.allowed_formats = 1 << int(trt.TensorFormat.LINEAR)
+            if dtype == torch.float16:
+                input_tensor.dtype = trt.DataType.HALF
+            elif dtype == torch.bfloat16:
+                input_tensor.dtype = trt.DataType.BF16
+            else:
+                input_tensor.dtype = trt.DataType.FLOAT
+            print(f"  Input '{input_tensor.name}': forced to {input_tensor.dtype}")
+        
+        # Mark output layers to use high precision (no quantization)
+        for i in range(network.num_outputs):
+            output_tensor = network.get_output(i)
+            output_tensor.allowed_formats = 1 << int(trt.TensorFormat.LINEAR)
+            if dtype == torch.float16:
+                output_tensor.dtype = trt.DataType.HALF
+            elif dtype == torch.bfloat16:
+                output_tensor.dtype = trt.DataType.BF16
+            else:
+                output_tensor.dtype = trt.DataType.FLOAT
+            print(f"  Output '{output_tensor.name}': forced to {output_tensor.dtype}")
 
         config.add_optimization_profile(profile)
 
@@ -1149,53 +440,19 @@ class TRT_MODEL_CONVERSION_BASE:
                 ),
             )
 
-        logging.info("[TensorRT] Building TensorRT engine")
-        try:
-            # Start heartbeat before build to show logs inside long steps
-            monitor = config.progress_monitor  # type: ignore[attr-defined]
-            stop_event = None
-            hb_thread = None
-            if isinstance(monitor, TQDMProgressMonitor):
-                try:
-                    stop_event, hb_thread = self._start_progress_heartbeat(monitor, interval_s=5.0)
-                except Exception:
-                    pass
+        serialized_engine = builder.build_serialized_network(network, config)
 
-            serialized_engine = builder.build_serialized_network(network, config)
-            logging.info("[TensorRT] Successfully built TensorRT engine")
-            
-            if serialized_engine is None:
-                logging.error("[TensorRT] Engine serialization failed!")
-                return ()
+        full_output_folder, filename, counter, subfolder, filename_prefix = (
+            folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+        )
+        output_trt_engine = os.path.join(
+            full_output_folder, f"{filename}_{counter:05}_.engine"
+        )
 
-            full_output_folder, filename, counter, subfolder, filename_prefix = (
-                folder_paths.get_save_image_path(filename_prefix, self.output_dir)
-            )
-            output_trt_engine = os.path.join(
-                full_output_folder, f"{filename}_{counter:05}_.engine"
-            )
-            
-            logging.info(f"[TensorRT] Saving engine to: {output_trt_engine}")
-            with open(output_trt_engine, "wb") as f:
-                f.write(serialized_engine)
-            logging.info("[TensorRT] Engine saved successfully")
+        with open(output_trt_engine, "wb") as f:
+            f.write(serialized_engine)
 
-            logging.info("[TensorRT] Saving timing cache")
-            self._save_timing_cache(config)
-            logging.info("[TensorRT] Timing cache saved")
-            
-        except Exception as e:
-            logging.error(f"[TensorRT] Error during engine building/saving: {str(e)}")
-            raise
-        finally:
-            # Stop heartbeat if it was started
-            try:
-                if 'stop_event' in locals() and stop_event is not None:
-                    stop_event.set()
-                if 'hb_thread' in locals() and hb_thread is not None:
-                    hb_thread.join(timeout=1.0)
-            except Exception:
-                pass
+        self._save_timing_cache(config)
 
         return ()
 
@@ -1210,7 +467,6 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             "required": {
                 "model": ("MODEL",),
                 "filename_prefix": ("STRING", {"default": "tensorrt/ComfyUI_DYN"}),
-                "fast_build": ("BOOLEAN", {"default": False}),
                 "batch_size_min": (
                     "INT",
                     {
@@ -1297,7 +553,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                     {
                         "default": 1,
                         "min": 1,
-                        "max": 512,
+                        "max": 128,
                         "step": 1,
                     },
                 ),
@@ -1306,7 +562,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                     {
                         "default": 1,
                         "min": 1,
-                        "max": 512,
+                        "max": 128,
                         "step": 1,
                     },
                 ),
@@ -1315,7 +571,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                     {
                         "default": 1,
                         "min": 1,
-                        "max": 512,
+                        "max": 128,
                         "step": 1,
                     },
                 ),
@@ -1335,7 +591,6 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         self,
         model,
         filename_prefix,
-        fast_build,
         batch_size_min,
         batch_size_opt,
         batch_size_max,
@@ -1367,7 +622,6 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             context_max,
             num_video_frames,
             is_static=False,
-            fast_build=fast_build,
         )
 
 
@@ -1381,7 +635,6 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             "required": {
                 "model": ("MODEL",),
                 "filename_prefix": ("STRING", {"default": "tensorrt/ComfyUI_STAT"}),
-                "fast_build": ("BOOLEAN", {"default": True}),
                 "batch_size_opt": (
                     "INT",
                     {
@@ -1434,7 +687,6 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         self,
         model,
         filename_prefix,
-        fast_build,
         batch_size_opt,
         height_opt,
         width_opt,
@@ -1458,7 +710,6 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             context_opt,
             num_video_frames,
             is_static=True,
-            fast_build=fast_build,
         )
 
 
