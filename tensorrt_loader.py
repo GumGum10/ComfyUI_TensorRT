@@ -116,6 +116,10 @@ class TrTUnet:
         # Synchronize the stream to ensure all operations complete before returning
         self.stream.synchronize()
         return out
+    
+    def forward(self, x, timesteps, context, y=None, control=None, transformer_options=None, **kwargs):
+        """Forward method that calls __call__ for compatibility with teacache/others."""
+        return self.__call__(x, timesteps, context, y=y, control=control, transformer_options=transformer_options, **kwargs)
 
     def load_state_dict(self, sd, strict=False):
         pass
